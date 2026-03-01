@@ -1,6 +1,6 @@
-use crate::commands::find_upstream;
 use anyhow::{Result, anyhow};
 use git2::{Oid, Repository};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
@@ -87,7 +87,7 @@ pub fn get_immediate_successors(
     let mut candidates = Vec::new();
     for b in stack_branches {
         if b.id != current_id
-            && (repo.graph_descendant_of(b.id, current_id)? || current_id.is_zero())
+            && (current_id.is_zero() || repo.graph_descendant_of(b.id, current_id)?)
         {
             candidates.push(b);
         }
@@ -232,6 +232,36 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
     Ok(())
 }
 
+pub fn build_parent_maps(
+    repo: &Repository,
+    sub_stack: &[StackBranch],
+    all_branches_in_stack: &[StackBranch],
+    merge_base: Oid,
+    head_id: Oid,
+    current_branch_name: &str,
+) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
+    let mut parent_id_map = HashMap::new();
+    let mut parent_name_map = HashMap::new();
+
+    for sb in sub_stack {
+        let parent_id = find_parent_in_stack(repo, &sb.name, all_branches_in_stack, merge_base)?;
+        parent_id_map.insert(sb.name.clone(), parent_id.to_string());
+
+        // Resolve parent_name_map by finding a parent branch in sub_stack with matching id (and different name)
+        if let Some(parent_branch) = sub_stack
+            .iter()
+            .find(|p| p.id == parent_id && p.name != sb.name)
+        {
+            parent_name_map.insert(sb.name.clone(), parent_branch.name.clone());
+        } else if parent_id == head_id {
+            // or, if parent_id == head_id, map to current_branch_name
+            parent_name_map.insert(sb.name.clone(), current_branch_name.to_string());
+        }
+    }
+
+    Ok((parent_id_map, parent_name_map))
+}
+
 #[derive(Clone)]
 pub struct VisualBranch {
     pub name: String,
@@ -240,16 +270,10 @@ pub struct VisualBranch {
 
 pub fn visualize_stack(
     repo: &Repository,
-    merge_base: Oid,
     all_branches: &[StackBranch],
     current_branch_name: Option<&str>,
 ) -> Result<Vec<VisualBranch>> {
     let mut result = Vec::new();
-    let _ = find_upstream(repo)?;
-
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push_range(&format!("{}..HEAD", merge_base))?;
-    revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
 
     let mut stack_branches = all_branches.to_vec();
     sort_branches_topologically(repo, &mut stack_branches)?;

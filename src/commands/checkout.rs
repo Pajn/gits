@@ -49,7 +49,8 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                 merge_base,
                 &upstream_name,
             )?;
-            let successors = get_immediate_successors(&repo, head_id, &branches)?;
+            let mut successors = get_immediate_successors(&repo, head_id, &branches)?;
+            successors.sort();
 
             match successors.len() {
                 0 => Err(anyhow!("Already at the top of the stack")),
@@ -86,7 +87,8 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                 merge_base,
                 &upstream_name,
             )?;
-            let tips = get_stack_tips(&repo, &branches)?;
+            let mut tips = get_stack_tips(&repo, &branches)?;
+            tips.sort();
             match tips.len() {
                 0 => Err(anyhow!("No branches in stack")),
                 1 => perform_git_checkout(&tips[0]),
@@ -107,12 +109,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                 &upstream_name,
             )?;
 
-            let visualized = visualize_stack(
-                &repo,
-                merge_base,
-                &all_branches,
-                current_branch_name.as_deref(),
-            )?;
+            let visualized = visualize_stack(&repo, &all_branches, current_branch_name.as_deref())?;
 
             if visualized.is_empty() {
                 println!(
