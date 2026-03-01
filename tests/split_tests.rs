@@ -2,6 +2,8 @@
 use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::process::Stdio;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
@@ -32,8 +34,14 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
     for i in 1..=3 {
         let tree_oid = {
             let mut index = repo.index().unwrap();
-            fs::write(dir.path().join("file.txt"), format!("content {}", i)).unwrap();
-            index.add_path(std::path::Path::new("file.txt")).unwrap();
+            fs::write(
+                dir.path().join(format!("file{}.txt", i)),
+                format!("content {}", i),
+            )
+            .unwrap();
+            index
+                .add_path(std::path::Path::new(&format!("file{}.txt", i)))
+                .unwrap();
             index.write_tree().unwrap()
         };
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -409,4 +417,155 @@ exit 0
         .write_stdin("\n")
         .assert()
         .success();
+}
+
+#[test]
+fn test_checkout_all_works_without_main() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+
+    fs::write(dir.path().join("file.txt"), "initial").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("file.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    repo.commit(
+        Some("refs/heads/trunk"),
+        &signature,
+        &signature,
+        "initial commit",
+        &tree,
+        &[],
+    )
+    .unwrap();
+
+    repo.set_head("refs/heads/trunk").unwrap();
+
+    let bin_path = assert_cmd::cargo::cargo_bin("gits");
+
+    let mut child = std::process::Command::new(bin_path)
+        .arg("checkout")
+        .arg("--all")
+        .current_dir(dir.path())
+        .env("TERM", "dumb")
+        .env("INQUIRE_SKIP_TTY_CHECK", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn gits");
+
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let tx_stdout = tx.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line
+                && line.contains("Select branch to checkout")
+            {
+                let _ = tx_stdout.send(true);
+                return;
+            }
+        }
+    });
+
+    let tx_stderr = tx;
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line
+                && line.contains("Select branch to checkout")
+            {
+                let _ = tx_stderr.send(true);
+                return;
+            }
+        }
+    });
+
+    let found_menu = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+
+    let _ = child.kill();
+    assert!(found_menu, "Interactive menu did not appear");
+}
+
+#[test]
+fn test_checkout_all_detached_no_main() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+
+    fs::write(dir.path().join("file.txt"), "initial").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("file.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let commit_id = repo
+        .commit(
+            Some("refs/heads/trunk"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .unwrap();
+
+    // Detach HEAD
+    repo.set_head_detached(commit_id).unwrap();
+
+    let bin_path = assert_cmd::cargo::cargo_bin("gits");
+
+    let mut child = std::process::Command::new(bin_path)
+        .arg("checkout")
+        .arg("--all")
+        .current_dir(dir.path())
+        .env("TERM", "dumb")
+        .env("INQUIRE_SKIP_TTY_CHECK", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn gits");
+
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let tx_stdout = tx.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line
+                && line.contains("Select branch to checkout")
+            {
+                let _ = tx_stdout.send(true);
+                return;
+            }
+        }
+    });
+
+    let tx_stderr = tx;
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line
+                && line.contains("Select branch to checkout")
+            {
+                let _ = tx_stderr.send(true);
+                return;
+            }
+        }
+    });
+
+    let found_menu = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+
+    let _ = child.kill();
+    assert!(
+        found_menu,
+        "Interactive menu did not appear in detached HEAD state"
+    );
 }

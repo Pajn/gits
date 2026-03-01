@@ -66,9 +66,6 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         ));
     }
 
-    let upstream_name = find_upstream(repo)?;
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
 
@@ -79,9 +76,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     }
     .ok_or_else(|| anyhow!("You must be on a branch to use 'move'"))?;
 
-    let merge_base = repo.merge_base(upstream_id, head_id)?;
-    let all_branches_in_stack = get_all_stack_branches(repo, merge_base, &upstream_name)?;
-
+    // Determine target branch
     let selected_target_name = if let Some(target) = &args.onto {
         target.clone()
     } else if args.all {
@@ -96,6 +91,13 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         branch_names.sort();
         inquire::Select::new("Select target branch to move onto:", branch_names).prompt()?
     } else {
+        // Only here we MUST have an upstream
+        let upstream_name = find_upstream(repo)?;
+        let upstream_obj = repo.revparse_single(&upstream_name)?;
+        let upstream_id = upstream_obj.id();
+        let merge_base = repo.merge_base(upstream_id, head_id)?;
+        let all_branches_in_stack = get_all_stack_branches(repo, merge_base, &upstream_name)?;
+
         let visualized = visualize_stack(
             repo,
             merge_base,
@@ -104,7 +106,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         )?;
 
         if visualized.is_empty() {
-            println!("No branches found in the stack to move.");
+            println!("No branches found in the stack to move. Use --all to see everything.");
             return Ok(());
         }
 
@@ -116,7 +118,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             .iter()
             .find(|v| v.display_name == selected_display)
             .map(|v| v.name.clone())
-            .unwrap()
+            .ok_or_else(|| anyhow!("Failed to find selected branch '{}'", selected_display))?
     };
 
     // Validate target exists
@@ -127,6 +129,14 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         println!("Already on that branch.");
         return Ok(());
     }
+
+    // Now we need the stack info to perform the rebase.
+    // Even if we used --all to pick the target, we still need find_upstream to know the sub-stack.
+    let upstream_name = find_upstream(repo)?;
+    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_id = upstream_obj.id();
+    let merge_base = repo.merge_base(upstream_id, head_id)?;
+    let all_branches_in_stack = get_all_stack_branches(repo, merge_base, &upstream_name)?;
 
     let mut sub_stack = Vec::new();
     collect_descendants(
@@ -225,7 +235,10 @@ fn show_status(repo: &Repository) -> Result<()> {
 fn run_move_loop(repo: &Repository, mut state: MoveState) -> Result<()> {
     while !state.remaining_branches.is_empty() {
         let current_name = state.remaining_branches[0].clone();
-        let old_parent_id_str = state.parent_id_map.get(&current_name).unwrap();
+        let old_parent_id_str = state
+            .parent_id_map
+            .get(&current_name)
+            .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", current_name))?;
 
         let new_base = if current_name == state.original_branch {
             state.target_branch.clone()

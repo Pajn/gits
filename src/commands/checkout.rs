@@ -5,11 +5,32 @@ use crate::stack::{
     visualize_stack,
 };
 use anyhow::{Context, Result, anyhow};
-use git2::Repository;
+use git2::{BranchType, Repository};
 use std::process::Command;
 
-pub fn checkout(subcommand: &Option<CheckoutSubcommand>) -> Result<()> {
+pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()> {
     let repo = Repository::open(".").context("Failed to open git repository.")?;
+
+    if all && subcommand.is_none() {
+        let mut branch_names = Vec::new();
+        let local_branches = repo.branches(Some(BranchType::Local))?;
+        for res in local_branches {
+            let (branch, _) = res?;
+            if let Some(name) = branch.name()? {
+                branch_names.push(name.to_string());
+            }
+        }
+        branch_names.sort();
+
+        if branch_names.is_empty() {
+            println!("No local branches found.");
+            return Ok(());
+        }
+
+        let selected_name =
+            inquire::Select::new("Select branch to checkout:", branch_names).prompt()?;
+        return perform_git_checkout(&selected_name);
+    }
 
     let upstream_name = find_upstream(&repo)?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
@@ -78,7 +99,6 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>) -> Result<()> {
             }
         }
         None => {
-            // Interactive visualization
             let merge_base = repo.merge_base(upstream_id, head_id)?;
             let all_branches = get_all_stack_branches(&repo, merge_base, &upstream_name)?;
 
@@ -91,7 +111,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>) -> Result<()> {
 
             if visualized.is_empty() {
                 println!(
-                    "No branches found in the current stack (excluding {}).",
+                    "No branches found in the current stack (excluding {}). Use --all to see everything.",
                     upstream_name
                 );
                 return Ok(());
@@ -105,7 +125,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>) -> Result<()> {
                 .iter()
                 .find(|v| v.display_name == selected_display)
                 .map(|v| v.name.clone())
-                .unwrap();
+                .ok_or_else(|| anyhow!("Failed to find selected branch '{}'", selected_display))?;
 
             perform_git_checkout(&selected_name)
         }
