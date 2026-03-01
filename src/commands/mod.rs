@@ -1,11 +1,15 @@
+pub mod abort_cmd;
 pub mod checkout;
 pub mod commit;
+pub mod continue_cmd;
 pub mod move_cmd;
 pub mod push;
 pub mod split;
+pub mod status_cmd;
 
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
+use std::io::IsTerminal;
 
 pub struct CommitInfo {
     pub id: String,
@@ -13,7 +17,7 @@ pub struct CommitInfo {
 }
 
 pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
-    if std::env::var("TERM").unwrap_or_default() == "dumb" {
+    if !std::io::stdin().is_terminal() {
         if options.is_empty() {
             return Err(anyhow!("No options available for selection"));
         }
@@ -26,9 +30,9 @@ pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
 }
 
 pub fn prompt_multi_select<T: std::fmt::Display>(message: &str, options: Vec<T>) -> Result<Vec<T>> {
-    if std::env::var("TERM").unwrap_or_default() == "dumb" {
-        println!("{} (auto-selecting all {} options)", message, options.len());
-        return Ok(options);
+    if !std::io::stdin().is_terminal() {
+        println!("{} (non-interactive mode: auto-selecting NONE)", message);
+        return Ok(Vec::new());
     }
     inquire::MultiSelect::new(message, options)
         .prompt()

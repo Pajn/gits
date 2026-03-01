@@ -2,11 +2,14 @@ mod commands;
 mod rebase_utils;
 mod stack;
 
+use crate::commands::abort_cmd::abort_cmd;
 use crate::commands::checkout::checkout;
 use crate::commands::commit::commit;
-use crate::commands::move_cmd::{MoveArgs, abort_cmd, continue_cmd, move_cmd, status_cmd};
+use crate::commands::continue_cmd::continue_cmd;
+use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::push::push;
 use crate::commands::split::split;
+use crate::commands::status_cmd::status_cmd;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -79,6 +82,8 @@ struct TerminalRestorer;
 
 impl Drop for TerminalRestorer {
     fn drop(&mut self) {
+        // crossterm::terminal::disable_raw_mode is safe to call unconditionally
+        // as it will return an error if raw mode wasn't enabled, which we ignore here.
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }

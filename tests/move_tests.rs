@@ -598,22 +598,10 @@ fn test_move_onto_descendant() {
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
-        .success();
-
-    let fa_new = repo
-        .find_branch("feature-a", git2::BranchType::Local)
-        .unwrap();
-    let fb_ref = repo
-        .find_branch("feature-b", git2::BranchType::Local)
-        .unwrap();
-    assert!(
-        repo.graph_descendant_of(
-            fa_new.get().target().unwrap(),
-            fb_ref.get().target().unwrap()
-        )
-        .unwrap()
-            || fa_new.get().target().unwrap() == fb_ref.get().target().unwrap()
-    );
+        .failure()
+        .stderr(predicates::str::contains(
+            "Target branch 'feature-b' is inside the subtree being moved.",
+        ));
 }
 
 #[test]
@@ -1186,13 +1174,17 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let _ = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("rebase")
         .arg("target")
         .current_dir(dir.path())
         .output()
         .unwrap();
-    // This rebase is expected to fail with a conflict, so we don't assert status.success()
+    // This rebase is expected to fail with a conflict
+    assert!(
+        !out.status.success(),
+        "rebase should have failed with conflict"
+    );
 
     // Manually create a gits move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");

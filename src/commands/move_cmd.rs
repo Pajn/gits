@@ -1,15 +1,9 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{
-    Operation, RebaseState, load_state, run_rebase_loop, save_state, state_path,
-};
-use crate::stack::{
-    collect_descendants, find_parent_in_stack, get_stack_branches_from_merge_base, visualize_stack,
-};
+use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state, state_path};
+use crate::stack::{collect_descendants, get_stack_branches_from_merge_base, visualize_stack};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::Repository;
-use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Args)]
 pub struct MoveArgs {
@@ -81,12 +75,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         let all_branches_in_stack =
             get_stack_branches_from_merge_base(repo, merge_base, &upstream_name)?;
 
-        let visualized = visualize_stack(
-            repo,
-            merge_base,
-            &all_branches_in_stack,
-            Some(&current_branch_name),
-        )?;
+        let visualized = visualize_stack(repo, &all_branches_in_stack, Some(&current_branch_name))?;
 
         if visualized.is_empty() {
             println!("No branches found in the stack to move. Use --all to see everything.");
@@ -130,24 +119,24 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         &mut sub_stack,
     )?;
 
+    // Reject move target if it lies inside the subtree being moved
+    if sub_stack.iter().any(|b| b.name == selected_target_name) {
+        return Err(anyhow!(
+            "Target branch '{}' is inside the subtree being moved.",
+            selected_target_name
+        ));
+    }
+
     crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
-    let mut parent_id_map = HashMap::new();
-    let mut parent_name_map = HashMap::new();
-    for sb in &sub_stack {
-        let parent_id = find_parent_in_stack(repo, &sb.name, &all_branches_in_stack, merge_base)?;
-        parent_id_map.insert(sb.name.clone(), parent_id.to_string());
-
-        if let Some(parent_branch) = sub_stack
-            .iter()
-            .find(|p| p.id == parent_id && p.name != sb.name)
-        {
-            parent_name_map.insert(sb.name.clone(), parent_branch.name.clone());
-        } else if sb.name == current_branch_name {
-            // The root of our move rebases onto the selected target
-            parent_name_map.insert(sb.name.clone(), selected_target_name.clone());
-        }
-    }
+    let (parent_id_map, parent_name_map) = crate::stack::build_parent_maps(
+        repo,
+        &sub_stack,
+        &all_branches_in_stack,
+        merge_base,
+        head_id,
+        &current_branch_name,
+    )?;
 
     let state = RebaseState {
         operation: Operation::Move,
@@ -165,64 +154,4 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
     save_state(repo, &state)?;
     run_rebase_loop(repo, state)
-}
-
-pub fn continue_cmd() -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
-    let state = load_state(&repo)?;
-
-    if repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists() {
-        println!("Continuing git rebase...");
-        let status = Command::new("git")
-            .arg("rebase")
-            .arg("--continue")
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!(
-                "git rebase --continue failed. Resolve conflicts and try again."
-            ));
-        }
-    }
-
-    run_rebase_loop(&repo, state)
-}
-
-pub fn abort_cmd() -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
-    let path = state_path(&repo);
-    if path.exists() {
-        // Only try to abort a git rebase if we were actually in a gits operation
-        if repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists() {
-            println!("Aborting active git rebase...");
-            let status = Command::new("git").arg("rebase").arg("--abort").status()?;
-            if !status.success() {
-                return Err(anyhow!("Failed to abort git rebase."));
-            }
-        }
-
-        std::fs::remove_file(path)?;
-        println!("Operation aborted (state cleared).");
-    } else {
-        println!("No operation in progress.");
-    }
-
-    Ok(())
-}
-
-pub fn status_cmd() -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
-    let state = load_state(&repo)?;
-    let op_name = match state.operation {
-        Operation::Move => "Move",
-        Operation::Commit => "Commit",
-    };
-    println!(
-        "{} in progress: {} onto {}",
-        op_name, state.original_branch, state.target_branch
-    );
-    println!(
-        "Remaining branches: {}",
-        state.remaining_branches.join(", ")
-    );
-    Ok(())
 }

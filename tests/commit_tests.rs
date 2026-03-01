@@ -677,6 +677,34 @@ fn test_commit_abort() {
 }
 
 #[test]
+fn test_commit_reentry_guard() {
+    let (dir, _repo) = setup_repo();
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+
+    // Create the state file to simulate an ongoing operation
+    fs::write(&state_path, "{}").unwrap();
+
+    // Attempt to run gits commit
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.arg("commit")
+        .arg("-m")
+        .arg("test")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "operation is already in progress",
+        ));
+
+    // Verify state file still exists
+    assert!(state_path.exists());
+}
+
+#[test]
 fn test_commit_on_main_rebases_descendant() {
     let (dir, repo) = setup_repo();
 
@@ -861,5 +889,5 @@ fn test_commit_failure_is_propagated() {
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
         .failure()
-        .stderr(predicates::str::contains("nothing to commit"));
+        .stdout(predicates::str::contains("nothing to commit"));
 }
