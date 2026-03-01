@@ -28,6 +28,9 @@ enum Commands {
     Checkout {
         #[command(subcommand)]
         subcommand: Option<CheckoutSubcommand>,
+        /// List all local branches instead of just the stack
+        #[arg(long)]
+        all: bool,
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
@@ -64,7 +67,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
-        Commands::Checkout { subcommand } => checkout(subcommand)?,
+        Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();

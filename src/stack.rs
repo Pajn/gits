@@ -118,7 +118,10 @@ fn visualize_recursive(
     successors.sort(); // Sort siblings alphabetically
 
     for name in successors {
-        let branch = stack_branches.iter().find(|b| b.name == name).unwrap();
+        let branch = stack_branches
+            .iter()
+            .find(|b| b.name == name)
+            .ok_or_else(|| anyhow!("Branch '{}' not found in stack branches", name))?;
         let indent = "  ".repeat(depth);
         let marker = if Some(name.as_str()) == current_branch_name {
             "* "

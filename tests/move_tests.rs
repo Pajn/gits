@@ -151,7 +151,6 @@ fn test_move_restore_checkout_failure() {
     )
     .unwrap();
 
-    // Portably find real git
     let git_path = which::which("git").expect("git not found");
 
     let git_mock = dir.path().join("git");
@@ -231,7 +230,6 @@ fn test_move_conflict_and_continue() {
     let repo = Repository::init(dir.path()).unwrap();
     let signature = Signature::now("Test User", "test@example.com").unwrap();
 
-    // 1. Initial commit
     fs::write(dir.path().join("file.txt"), "base").unwrap();
     let mut index = repo.index().unwrap();
     index.add_path(std::path::Path::new("file.txt")).unwrap();
@@ -249,7 +247,6 @@ fn test_move_conflict_and_continue() {
         .unwrap();
     let base = repo.find_commit(base_id).unwrap();
 
-    // 2. Branch 'target' with change to file.txt
     fs::write(dir.path().join("file.txt"), "target content").unwrap();
     index.add_path(std::path::Path::new("file.txt")).unwrap();
     let oid = index.write_tree().unwrap();
@@ -266,7 +263,6 @@ fn test_move_conflict_and_continue() {
         .unwrap();
     let target = repo.find_commit(target_id).unwrap();
 
-    // 3. Branch 'feature' with conflicting change to file.txt
     fs::write(dir.path().join("file.txt"), "feature content").unwrap();
     index.add_path(std::path::Path::new("file.txt")).unwrap();
     let oid = index.write_tree().unwrap();
@@ -303,7 +299,6 @@ fn test_move_conflict_and_continue() {
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
 
-    // Resolve conflict
     fs::write(dir.path().join("file.txt"), "resolved content").unwrap();
     let mut cmd_git_add = Command::new("git");
     cmd_git_add
@@ -322,7 +317,6 @@ fn test_move_conflict_and_continue() {
         .assert()
         .success();
 
-    // Continue move
     let mut cmd_cont = Command::cargo_bin("gits").unwrap();
     cmd_cont
         .arg("move")
@@ -331,7 +325,6 @@ fn test_move_conflict_and_continue() {
         .assert()
         .success();
 
-    // Verify completion
     let feature_new = repo
         .find_branch("feature", git2::BranchType::Local)
         .unwrap();
@@ -367,7 +360,6 @@ fn test_move_abort() {
         .assert()
         .success();
 
-    // No move in progress
     let mut cmd_abort = Command::cargo_bin("gits").unwrap();
     cmd_abort
         .arg("move")
@@ -376,6 +368,173 @@ fn test_move_abort() {
         .assert()
         .success()
         .stdout(predicates::str::contains("No move operation in progress"));
+}
+
+#[test]
+fn test_move_all_onto_main() {
+    let (dir, repo) = setup_repo();
+
+    let head_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let head = repo.find_commit(head_id).unwrap();
+    repo.branch("feature", &head, false).unwrap();
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_tree(
+        head.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.arg("move")
+        .arg("--all")
+        .arg("--onto")
+        .arg("main")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let feature = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap();
+    let main = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    assert!(
+        repo.graph_descendant_of(
+            feature.get().target().unwrap(),
+            main.get().target().unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn test_move_all_from_main_error() {
+    let (dir, _repo) = setup_repo();
+
+    let mut cmd_co = Command::new("git");
+    cmd_co
+        .arg("checkout")
+        .arg("main")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.arg("move")
+        .arg("--all")
+        .arg("--onto")
+        .arg("feature-a")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Target 'feature-a' not found."));
+}
+
+#[test]
+fn test_move_all_between_stacks() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+
+    fs::write(dir.path().join("root.txt"), "root").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("root.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let base_id = repo
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "root",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    let base = repo.find_commit(base_id).unwrap();
+
+    fs::write(dir.path().join("s1.txt"), "s1-a").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("s1.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let s1a_id = repo
+        .commit(None, &signature, &signature, "s1-a commit", &tree, &[&base])
+        .unwrap();
+    let s1a = repo.find_commit(s1a_id).unwrap();
+    repo.branch("s1-a", &s1a, false).unwrap();
+
+    fs::write(dir.path().join("s1_other.txt"), "s1-b").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_path(std::path::Path::new("s1_other.txt"))
+        .unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let s1b_id = repo
+        .commit(None, &signature, &signature, "s1-b commit", &tree, &[&s1a])
+        .unwrap();
+    let s1b = repo.find_commit(s1b_id).unwrap();
+    repo.branch("s1-b", &s1b, false).unwrap();
+
+    let mut index = repo.index().unwrap();
+    repo.checkout_tree(
+        base.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+    fs::write(dir.path().join("s2.txt"), "s2-a").unwrap();
+    index.add_path(std::path::Path::new("s2.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let s2a_id = repo
+        .commit(None, &signature, &signature, "s2-a commit", &tree, &[&base])
+        .unwrap();
+    let s2a = repo.find_commit(s2a_id).unwrap();
+    repo.branch("s2-a", &s2a, false).unwrap();
+
+    repo.set_head("refs/heads/s1-a").unwrap();
+    repo.checkout_tree(
+        s1a.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.arg("move")
+        .arg("--all")
+        .arg("--onto")
+        .arg("s2-a")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let s1a_new = repo.find_branch("s1-a", git2::BranchType::Local).unwrap();
+    let s1b_new = repo.find_branch("s1-b", git2::BranchType::Local).unwrap();
+    let s2a_ref = repo.find_branch("s2-a", git2::BranchType::Local).unwrap();
+    assert!(
+        repo.graph_descendant_of(
+            s1a_new.get().target().unwrap(),
+            s2a_ref.get().target().unwrap()
+        )
+        .unwrap()
+            || s1a_new.get().target().unwrap() == s2a_ref.get().target().unwrap()
+    );
+    assert!(
+        repo.graph_descendant_of(
+            s1b_new.get().target().unwrap(),
+            s1a_new.get().target().unwrap()
+        )
+        .unwrap()
+            || s1b_new.get().target().unwrap() == s1a_new.get().target().unwrap()
+    );
 }
 
 #[test]
