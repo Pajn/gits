@@ -1,36 +1,119 @@
+use crate::CheckoutSubcommand;
 use crate::commands::find_upstream;
-use crate::stack::get_stack_branches;
+use crate::stack::{
+    get_all_stack_branches, get_immediate_successors, get_stack_branches, get_stack_tips,
+    visualize_stack,
+};
 use anyhow::{Context, Result, anyhow};
 use git2::Repository;
 use std::process::Command;
 
-pub fn checkout() -> Result<()> {
+pub fn checkout(subcommand: &Option<CheckoutSubcommand>) -> Result<()> {
     let repo = Repository::open(".").context("Failed to open git repository.")?;
 
     let upstream_name = find_upstream(&repo)?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
-    let head_id = repo.head()?.peel_to_commit()?.id();
+    let head = repo.head()?;
+    let head_id = head.peel_to_commit()?.id();
 
-    let branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-    let mut branch_names: Vec<String> = branches.into_iter().map(|b| b.name).collect();
+    let current_branch_name = if !repo.head_detached()? {
+        head.shorthand().map(|s| s.to_string())
+    } else {
+        None
+    };
 
-    if branch_names.is_empty() {
-        println!(
-            "No branches found in the current stack (excluding {}).",
-            upstream_name
-        );
-        return Ok(());
+    match subcommand {
+        Some(CheckoutSubcommand::Up) => {
+            let branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+            let successors = get_immediate_successors(&repo, head_id, &branches)?;
+
+            match successors.len() {
+                0 => Err(anyhow!("Already at the top of the stack")),
+                1 => perform_git_checkout(&successors[0]),
+                _ => {
+                    let selected =
+                        inquire::Select::new("Multiple branches ahead. Select one:", successors)
+                            .prompt()?;
+                    perform_git_checkout(&selected)
+                }
+            }
+        }
+        Some(CheckoutSubcommand::Down) => {
+            let mut branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+            branches.sort_by(|a, b| {
+                if a.id == b.id {
+                    std::cmp::Ordering::Equal
+                } else if repo.graph_descendant_of(a.id, b.id).unwrap_or(false) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            });
+
+            let current_name = current_branch_name.ok_or_else(|| anyhow!("Not on a branch"))?;
+            let idx = branches
+                .iter()
+                .position(|b| b.name == current_name)
+                .ok_or_else(|| anyhow!("Current branch '{}' not in stack", current_name))?;
+
+            if idx > 0 {
+                perform_git_checkout(&branches[idx - 1].name)
+            } else {
+                perform_git_checkout(&upstream_name)
+            }
+        }
+        Some(CheckoutSubcommand::Top) => {
+            let branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+            let tips = get_stack_tips(&repo, &branches)?;
+            match tips.len() {
+                0 => Err(anyhow!("No branches in stack")),
+                1 => perform_git_checkout(&tips[0]),
+                _ => {
+                    let selected =
+                        inquire::Select::new("Multiple stack tips found. Select one:", tips)
+                            .prompt()?;
+                    perform_git_checkout(&selected)
+                }
+            }
+        }
+        None => {
+            // Interactive visualization
+            let merge_base = repo.merge_base(upstream_id, head_id)?;
+            let all_branches = get_all_stack_branches(&repo, merge_base, &upstream_name)?;
+
+            let visualized = visualize_stack(
+                &repo,
+                merge_base,
+                &all_branches,
+                current_branch_name.as_deref(),
+            )?;
+
+            if visualized.is_empty() {
+                println!(
+                    "No branches found in the current stack (excluding {}).",
+                    upstream_name
+                );
+                return Ok(());
+            }
+
+            let options: Vec<String> = visualized.iter().map(|v| v.display_name.clone()).collect();
+            let selected_display =
+                inquire::Select::new("Select branch to checkout:", options).prompt()?;
+
+            let selected_name = visualized
+                .iter()
+                .find(|v| v.display_name == selected_display)
+                .map(|v| v.name.clone())
+                .unwrap();
+
+            perform_git_checkout(&selected_name)
+        }
     }
+}
 
-    branch_names.sort();
-
-    let selected = inquire::Select::new("Select branch to checkout:", branch_names).prompt()?;
-
-    let status = Command::new("git")
-        .arg("checkout")
-        .arg(&selected)
-        .status()?;
+fn perform_git_checkout(name: &str) -> Result<()> {
+    let status = Command::new("git").arg("checkout").arg(name).status()?;
 
     if !status.success() {
         return Err(anyhow!("git checkout failed"));

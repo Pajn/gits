@@ -1,5 +1,5 @@
 use crate::commands::{CommitInfo, find_upstream};
-use crate::stack::get_stack_branches;
+use crate::stack::{get_stack_branches, get_stack_tips};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
@@ -21,15 +21,37 @@ pub fn split() -> Result<()> {
 
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
-    // Identify all branches in the linear stack (including those ahead of HEAD)
     let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-    let stack_branch_targets: Vec<_> = stack_branches.iter().map(|b| b.id).collect();
+    let tips = get_stack_tips(&repo, &stack_branches)?;
+
+    // If there are multiple tips, the user must choose one.
+    // If there are no tips (meaning no branches on the stack), we default to HEAD.
+    let (target_tip_name, target_tip_id) = match tips.len() {
+        0 => ("HEAD".to_string(), head_id),
+        1 => (tips[0].clone(), repo.revparse_single(&tips[0])?.id()),
+        _ => {
+            let selected = inquire::Select::new(
+                "Multiple stack tips found. Which path are you splitting?",
+                tips,
+            )
+            .prompt()?;
+            let id = repo.revparse_single(&selected)?.id();
+            (selected, id)
+        }
+    };
+
+    // Now we only care about branches that are on the linear path to the target tip.
+    let mut path_branches = Vec::new();
+    for b in stack_branches {
+        let is_on_path = (repo.graph_descendant_of(target_tip_id, b.id)? || target_tip_id == b.id)
+            && (repo.graph_descendant_of(b.id, merge_base)? || b.id == merge_base);
+        if is_on_path {
+            path_branches.push(b);
+        }
+    }
 
     let mut revwalk = repo.revwalk()?;
-    revwalk.push(head_id)?;
-    for target in stack_branch_targets {
-        revwalk.push(target)?;
-    }
+    revwalk.push(target_tip_id)?;
     revwalk.hide(merge_base)?;
     revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
 
@@ -51,9 +73,9 @@ pub fn split() -> Result<()> {
         return Ok(());
     }
 
-    // Map commits to branches (only local branches pointing into our stack)
+    // Map commits to branches (only local branches pointing into our path)
     let mut commit_to_branches: HashMap<String, Vec<String>> = HashMap::new();
-    for branch in stack_branches {
+    for branch in path_branches {
         let id_str = branch.id.to_string();
         if commit_ids.contains(&id_str) {
             commit_to_branches
@@ -80,6 +102,7 @@ pub fn split() -> Result<()> {
     buffer.push_str("# Remove 'branch <name>' rows to delete branches.\n");
     buffer.push_str("# DO NOT edit commit lines (SHA + summary).\n");
     buffer.push_str(&format!("# Base branch: {}\n", upstream_name));
+    buffer.push_str(&format!("# Path to tip: {}\n", target_tip_name));
 
     // Open editor
     let mut temp_file = NamedTempFile::new()?;

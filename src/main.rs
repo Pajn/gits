@@ -23,7 +23,20 @@ enum Commands {
     Push,
     /// Interactive branch checkout
     #[command(alias = "co")]
-    Checkout,
+    Checkout {
+        #[command(subcommand)]
+        subcommand: Option<CheckoutSubcommand>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CheckoutSubcommand {
+    /// Checkout the branch above the current one
+    Up,
+    /// Checkout the branch below the current one
+    Down,
+    /// Checkout the top branch in the stack
+    Top,
 }
 
 fn main() -> Result<()> {
@@ -32,7 +45,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
-        Commands::Checkout => checkout()?,
+        Commands::Checkout { subcommand } => checkout(subcommand)?,
     }
 
     Ok(())
