@@ -102,6 +102,7 @@ sed -i '/commit 2/a branch feature-x' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -140,6 +141,7 @@ sed -i '/commit 3/a branch another-feat' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -166,6 +168,7 @@ sed -i '/branch new-feat/d' "$file"
     .unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -204,6 +207,7 @@ sed -i 's/^[0-9a-f]\{7\}/deadbee/' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -240,6 +244,7 @@ sed -i '/branch current/d' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -262,6 +267,7 @@ fn test_push_multiple_remotes_no_origin_error() {
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -277,6 +283,7 @@ fn test_push_no_remotes_error() {
     // No remotes by default from setup_repo (except if we added any)
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -315,6 +322,9 @@ fn test_checkout_up_fork() {
     repo.set_head("refs/heads/base").unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
+    // fork-a and fork-b are both descendants of c1.
+    // They should both be in successors.
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
@@ -348,6 +358,7 @@ fn test_checkout_top_fork() {
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
@@ -390,6 +401,7 @@ exit 0
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     // Select first path
     cmd.arg("split")
         .current_dir(dir.path())
@@ -397,4 +409,70 @@ exit 0
         .write_stdin("\n")
         .assert()
         .success();
+}
+
+#[test]
+fn test_move_stack() {
+    let (dir, repo) = setup_repo();
+
+    // Stack:
+    // main -> commit 1 (base) -> commit 2 (feature-a) -> commit 3 (feature-b)
+    // Sibling:
+    // main -> commit 1 (independent)
+
+    let c1_id = repo.revparse_single("HEAD~2").unwrap().id();
+    let c2_id = repo.revparse_single("HEAD~1").unwrap().id();
+    let c3_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    let c1 = repo.find_commit(c1_id).unwrap();
+    let c2 = repo.find_commit(c2_id).unwrap();
+    let c3 = repo.find_commit(c3_id).unwrap();
+
+    repo.branch("base", &c1, false).unwrap();
+    repo.branch("feature-a", &c2, false).unwrap();
+    repo.branch("feature-b", &c3, false).unwrap();
+    repo.branch("independent", &c1, false).unwrap();
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    // Ensure clean working dir
+    repo.checkout_tree(
+        c2.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("independent")
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // Verification: feature-a should now be a descendant of independent
+    let fa = repo
+        .find_branch("feature-a", git2::BranchType::Local)
+        .unwrap();
+    let indep = repo
+        .find_branch("independent", git2::BranchType::Local)
+        .unwrap();
+    assert!(
+        repo.graph_descendant_of(fa.get().target().unwrap(), indep.get().target().unwrap())
+            .unwrap()
+    );
+
+    // feature-b should be a descendant of feature-a
+    let fb = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap();
+    assert!(
+        repo.graph_descendant_of(fb.get().target().unwrap(), fa.get().target().unwrap())
+            .unwrap()
+    );
 }

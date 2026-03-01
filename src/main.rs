@@ -2,6 +2,7 @@ mod commands;
 mod stack;
 
 use crate::commands::checkout::checkout;
+use crate::commands::move_cmd::move_cmd;
 use crate::commands::push::push;
 use crate::commands::split::split;
 use anyhow::Result;
@@ -27,6 +28,12 @@ enum Commands {
         #[command(subcommand)]
         subcommand: Option<CheckoutSubcommand>,
     },
+    /// Move current branch stack onto another branch
+    Move {
+        /// Target branch to move onto
+        #[arg(long)]
+        onto: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -46,6 +53,7 @@ fn main() -> Result<()> {
         Commands::Split => split()?,
         Commands::Push => push()?,
         Commands::Checkout { subcommand } => checkout(subcommand)?,
+        Commands::Move { onto } => move_cmd(onto.as_deref())?,
     }
 
     Ok(())
