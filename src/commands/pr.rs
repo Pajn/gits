@@ -1,0 +1,420 @@
+use crate::gh::{self, CreatePrParams};
+use crate::stack::{
+    StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
+};
+use anyhow::{Context, Result, anyhow};
+use git2::{BranchType, Repository};
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::process::Command;
+use tempfile::NamedTempFile;
+
+pub fn pr() -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = Repository::open(".").context("Failed to open git repository.")?;
+
+    let upstream_name = crate::commands::find_upstream(&repo)?;
+    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_id = upstream_obj.id();
+    let head_id = repo.head()?.peel_to_commit()?.id();
+
+    // Collect all stack branches and sort bottom→top so base branches are
+    // processed before the branches that depend on them.
+    let mut stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+    sort_branches_topologically(&repo, &mut stack_branches)?;
+
+    if stack_branches.is_empty() {
+        println!("No branches in stack.");
+        return Ok(());
+    }
+
+    // Only operate on branches that have a remote upstream configured.
+    let branches_with_upstream: Vec<(StackBranch, String)> = stack_branches
+        .into_iter()
+        .filter_map(|sb| {
+            let branch = repo.find_branch(&sb.name, BranchType::Local).ok()?;
+            let up = branch.upstream().ok()?;
+            let up_name = up.name().ok()??.to_string();
+            Some((sb, up_name))
+        })
+        .collect();
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream to create PRs for.");
+        println!("Run `gits push` first to set upstreams.");
+        return Ok(());
+    }
+
+    // Determine the correct base for each branch.
+    // The base is the branch directly beneath it in the stack (or the repo
+    // upstream if it sits directly on top of main/master).
+    let base_map = compute_base_map(&repo, &branches_with_upstream, &upstream_name)?;
+
+    println!(
+        "Found {} branch(es) with upstreams. Processing PRs...\n",
+        branches_with_upstream.len()
+    );
+
+    for (sb, _remote_upstream) in &branches_with_upstream {
+        let base = base_map
+            .get(&sb.name)
+            .cloned()
+            .unwrap_or_else(|| upstream_name.clone());
+        let base = normalize_base_for_gh(&base);
+
+        process_branch_pr(&repo, &sb.name, &base)?;
+        println!();
+    }
+
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-branch PR logic
+// ────────────────────────────────────────────────────────────────────────────
+
+fn normalize_base_for_gh(base: &str) -> String {
+    base.rsplit_once('/')
+        .map(|(_, short)| short)
+        .unwrap_or(base)
+        .to_string()
+}
+
+fn process_branch_pr(repo: &Repository, branch_name: &str, base: &str) -> Result<()> {
+    println!("── {} ──", branch_name);
+
+    // Check for an existing open PR
+    match gh::find_open_pr(branch_name)? {
+        Some(existing) => {
+            println!("  Open PR #{} found.", existing.number);
+            if existing.base_branch != base {
+                println!("  Updating base: {} → {}", existing.base_branch, base);
+                gh::update_pr_base(existing.number, base)?;
+                println!("  ✓ Base updated.");
+            } else {
+                println!("  Base is already '{}'. Nothing to update.", base);
+            }
+        }
+        None => {
+            // New PR: run the interactive wizard
+            create_pr_interactive(repo, branch_name, base)?;
+        }
+    }
+
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Interactive PR creation wizard
+// ────────────────────────────────────────────────────────────────────────────
+
+fn create_pr_interactive(repo: &Repository, branch_name: &str, base: &str) -> Result<()> {
+    let commits = get_branch_commits(repo, branch_name, base)?;
+
+    if commits.is_empty() {
+        println!(
+            "No commits on this branch compared to '{}'. Skipping.",
+            base
+        );
+        return Ok(());
+    }
+
+    // ── Step 1: Title ────────────────────────────────────────────────────────
+    let title = prompt_title(&commits)?;
+    if title.is_empty() {
+        println!("  PR title is empty. Skipping {}.", branch_name);
+        return Ok(());
+    }
+
+    // ── Step 2: Body ─────────────────────────────────────────────────────────
+    let body = prompt_body(branch_name, &commits)?;
+
+    // ── Step 3: Submit options ───────────────────────────────────────────────
+    let submission = prompt_submit_options()?;
+
+    println!("  Creating PR...");
+    let url = gh::create_pr(&CreatePrParams {
+        title,
+        body,
+        base: base.to_string(),
+        head: branch_name.to_string(),
+        draft: submission.draft,
+        labels: submission.labels,
+        reviewers: submission.reviewers,
+    })?;
+
+    println!("  ✓ PR created: {}", url);
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers: commits on branch
+// ────────────────────────────────────────────────────────────────────────────
+
+pub(crate) struct CommitSummary {
+    pub subject: String,
+}
+
+pub(crate) fn get_branch_commits(
+    repo: &Repository,
+    branch_name: &str,
+    base_name: &str,
+) -> Result<Vec<CommitSummary>> {
+    let branch_id = repo.revparse_single(branch_name)?.peel_to_commit()?.id();
+    let upstream_id = repo.revparse_single(base_name)?.peel_to_commit()?.id();
+
+    let merge_base = repo.merge_base(upstream_id, branch_id)?;
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(branch_id)?;
+    revwalk.hide(merge_base)?;
+    revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+
+    let mut commits = Vec::new();
+    for oid in revwalk {
+        let commit = repo.find_commit(oid?)?;
+        commits.push(CommitSummary {
+            subject: commit.summary().unwrap_or("").to_string(),
+        });
+    }
+
+    Ok(commits)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers: interactive prompts
+// ────────────────────────────────────────────────────────────────────────────
+
+fn prompt_title(commits: &[CommitSummary]) -> Result<String> {
+    let prefill = if commits.len() == 1 {
+        commits[0].subject.clone()
+    } else {
+        // Show commit list to help the user choose a title
+        println!("  Commits on this branch:");
+        for c in commits {
+            println!("    • {}", c.subject);
+        }
+        println!();
+        String::new()
+    };
+
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "  [non-interactive] Using title: {}",
+            if prefill.is_empty() {
+                "(empty)"
+            } else {
+                &prefill
+            }
+        );
+        return Ok(prefill);
+    }
+
+    let title = inquire::Text::new("  PR title:")
+        .with_initial_value(&prefill)
+        .prompt()
+        .context("Title prompt failed")?;
+
+    Ok(title)
+}
+
+fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
+    // Build commit list HTML comment preamble
+    let mut preamble = format!("<!--\nCommits on {}:\n", branch_name);
+    for c in commits {
+        preamble.push_str(&format!("- {}\n", c.subject));
+    }
+    preamble.push_str("-->\n");
+
+    // Try to read PR template
+    let template = read_pr_template().unwrap_or_default();
+
+    let editor_prefill = format!("{}\n{}", preamble, template);
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(editor_prefill);
+    }
+
+    println!("  PR body: [e] open editor  [b] leave blank  [enter] use PR template");
+
+    loop {
+        crossterm::terminal::enable_raw_mode()?;
+        let key = read_single_key();
+        crossterm::terminal::disable_raw_mode()?;
+
+        match key.as_deref() {
+            Some("e") => {
+                println!("e");
+                return open_editor_for_body(&editor_prefill);
+            }
+            Some("b") => {
+                println!("b");
+                return Ok(String::new());
+            }
+            Some("\r") | Some("\n") | Some("") => {
+                println!();
+                // Use template (open editor prefilled with preamble + template)
+                return open_editor_for_body(&editor_prefill);
+            }
+            _ => {
+                // ignore and re-prompt
+            }
+        }
+    }
+}
+
+fn open_editor_for_body(prefill: &str) -> Result<String> {
+    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let mut temp = NamedTempFile::new()?;
+    temp.write_all(prefill.as_bytes())?;
+    let path = temp.path().to_path_buf();
+
+    let status = Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("Failed to launch editor '{}'", editor))?;
+
+    if !status.success() {
+        return Err(anyhow!("Editor exited with non-zero status"));
+    }
+
+    let body = fs::read_to_string(&path)?;
+
+    // Strip the HTML comment preamble from the final body; it's only for
+    // the author's reference and should not appear in the PR description.
+    let cleaned = strip_html_comment(&body);
+    Ok(cleaned.trim().to_string())
+}
+
+fn strip_html_comment(s: &str) -> &str {
+    // Remove everything inside <!-- ... --> at the very start of the string.
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<!--")
+        && let Some(after) = rest.find("-->")
+    {
+        return &trimmed[4 + after + 3..]; // 4 = len("<!--"), 3 = len("-->")
+    }
+    s
+}
+
+fn read_pr_template() -> Option<String> {
+    // Look relative to cwd – same place git would use
+    let candidates = [
+        ".github/pull_request_template.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "pull_request_template.md",
+        "PULL_REQUEST_TEMPLATE.md",
+    ];
+    for path in candidates {
+        if let Ok(content) = fs::read_to_string(path) {
+            return Some(content);
+        }
+    }
+    None
+}
+
+/// Read one keypress from the terminal (raw mode must be enabled by caller).
+fn read_single_key() -> Option<String> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, read};
+
+    match read().ok()? {
+        Event::Key(KeyEvent { code, .. }) => match code {
+            KeyCode::Char(c) => Some(c.to_string()),
+            KeyCode::Enter => Some("\r".to_string()),
+            KeyCode::Esc => Some("esc".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Submit options menu
+// ────────────────────────────────────────────────────────────────────────────
+
+struct Submission {
+    draft: bool,
+    labels: Vec<String>,
+    reviewers: Vec<String>,
+}
+
+fn prompt_submit_options() -> Result<Submission> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut reviewers: Vec<String> = Vec::new();
+
+    let draft = loop {
+        let mut menu_items = vec!["Submit".to_string(), "Submit as draft".to_string()];
+
+        // Show current selections in the menu labels
+        if labels.is_empty() {
+            menu_items.push("Set labels".to_string());
+        } else {
+            menu_items.push(format!("Set labels [{}]", labels.join(", ")));
+        }
+
+        if reviewers.is_empty() {
+            menu_items.push("Assign reviewers".to_string());
+        } else {
+            menu_items.push(format!("Assign reviewers [{}]", reviewers.join(", ")));
+        }
+
+        let choice = crate::commands::prompt_select("  Ready to submit?", menu_items)?;
+
+        match choice.as_str() {
+            "Submit" => break false,
+            "Submit as draft" => break true,
+            s if s.starts_with("Set labels") => {
+                labels = prompt_labels()?;
+            }
+            s if s.starts_with("Assign reviewers") => {
+                reviewers = prompt_reviewers()?;
+            }
+            _ => {}
+        }
+    };
+
+    Ok(Submission {
+        draft,
+        labels,
+        reviewers,
+    })
+}
+
+fn prompt_labels() -> Result<Vec<String>> {
+    let available = gh::list_labels().unwrap_or_else(|_| Vec::new());
+
+    if available.is_empty() {
+        println!("  No labels found in this repository.");
+        return Ok(Vec::new());
+    }
+
+    let selected = crate::commands::prompt_multi_select(
+        "  Select labels (Space to toggle, Enter to confirm):",
+        available,
+    )?;
+    Ok(selected)
+}
+
+fn prompt_reviewers() -> Result<Vec<String>> {
+    let available = gh::list_collaborators().unwrap_or_else(|_| Vec::new());
+
+    if available.is_empty() {
+        println!("  No collaborators found for this repository.");
+        return Ok(Vec::new());
+    }
+
+    let selected = crate::commands::prompt_multi_select(
+        "  Select reviewers (Space to toggle, Enter to confirm):",
+        available,
+    )?;
+    Ok(selected)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// is_terminal helper (std::io::IsTerminal is in scope via mod.rs import)
+// ────────────────────────────────────────────────────────────────────────────
+
+use std::io::IsTerminal;

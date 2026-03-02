@@ -1,4 +1,5 @@
 mod commands;
+mod gh;
 mod rebase_utils;
 mod stack;
 
@@ -7,6 +8,7 @@ use crate::commands::checkout::checkout;
 use crate::commands::commit::commit;
 use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
+use crate::commands::pr::pr;
 use crate::commands::push::push;
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
@@ -28,6 +30,8 @@ enum Commands {
     Split,
     /// Pushes all branches with upstreams (atomic, force-with-lease)
     Push,
+    /// Create or update pull requests for all branches with upstreams
+    Pr,
     /// Interactive branch checkout
     #[command(alias = "co")]
     Checkout {
@@ -95,6 +99,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
+        Commands::Pr => pr()?,
         Commands::Commit { args } => commit(args)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
