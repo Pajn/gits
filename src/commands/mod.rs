@@ -3,6 +3,7 @@ pub mod checkout;
 pub mod commit;
 pub mod continue_cmd;
 pub mod move_cmd;
+pub mod pr;
 pub mod push;
 pub mod split;
 pub mod status_cmd;

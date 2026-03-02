@@ -232,6 +232,44 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
     Ok(())
 }
 
+/// For each branch build a map branch_name → base_branch_name.
+/// The base is the closest ancestor stack branch, or the repo upstream.
+pub fn compute_base_map(
+    repo: &Repository,
+    branches: &[(StackBranch, String)],
+    upstream_name: &str,
+) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for (sb, _) in branches {
+        let branch_id = sb.id;
+        let mut best: Option<&StackBranch> = None;
+
+        for (candidate, _) in branches {
+            if candidate.name == sb.name {
+                continue;
+            }
+
+            if repo.graph_descendant_of(branch_id, candidate.id)? {
+                if let Some(current_best) = best {
+                    if repo.graph_descendant_of(candidate.id, current_best.id)? {
+                        best = Some(candidate);
+                    }
+                } else {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        let base = best
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| upstream_name.to_string());
+        map.insert(sb.name.clone(), base);
+    }
+
+    Ok(map)
+}
+
 pub fn build_parent_maps(
     repo: &Repository,
     sub_stack: &[StackBranch],
