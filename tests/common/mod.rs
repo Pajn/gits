@@ -17,6 +17,10 @@ pub fn run_ok(program: &str, args: &[&str], cwd: &std::path::Path) {
     let output = std::process::Command::new(program)
         .args(args)
         .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Run Ok User")
+        .env("GIT_AUTHOR_EMAIL", "run-ok@example.com")
+        .env("GIT_COMMITTER_NAME", "Run Ok User")
+        .env("GIT_COMMITTER_EMAIL", "run-ok@example.com")
         .output()
         .expect("failed to execute command");
     assert!(

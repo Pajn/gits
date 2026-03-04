@@ -1,11 +1,211 @@
 use anyhow::{Result, anyhow};
 use git2::{Oid, Repository};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
     pub name: String,
     pub id: Oid,
+}
+
+#[derive(Clone, Debug)]
+pub struct RestackBoundary {
+    pub old_base: Oid,
+}
+
+pub fn find_restack_boundary(
+    repo: &Repository,
+    top_branch: &str,
+    upstream_name: &str,
+) -> Result<Option<RestackBoundary>> {
+    let top_id = repo.revparse_single(top_branch)?.id();
+    let upstream_id = repo.revparse_single(upstream_name)?.id();
+    let merge_base = repo.merge_base(top_id, upstream_id)?;
+
+    let first_parent_chain = collect_first_parent_chain(repo, merge_base, top_id)?;
+    if first_parent_chain.is_empty() {
+        return Ok(None);
+    }
+
+    let cherry_equivalent = cherry_equivalent_commits(repo, upstream_name, top_branch)?;
+    let matching_trees = commits_with_trees_on_upstream(repo, upstream_id, &first_parent_chain)?;
+
+    let mut prefix_end: isize = -1;
+    let mut last_tree_match: isize = -1;
+
+    for (idx, &commit_id) in first_parent_chain.iter().enumerate() {
+        if matching_trees.contains(&commit_id) {
+            last_tree_match = idx as isize;
+        }
+
+        let merged_by_graph =
+            repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
+        let merged_by_patch = cherry_equivalent.contains(&commit_id);
+        if merged_by_graph || merged_by_patch {
+            prefix_end = idx as isize;
+        }
+    }
+
+    // Tree matches can be ambiguous; only advance when ancestry or patch
+    // equivalence confirms the commit already landed upstream.
+    if last_tree_match > prefix_end {
+        let tree_match_commit = first_parent_chain[last_tree_match as usize];
+        if is_commit_in_upstream_or_patch_equivalent(
+            repo,
+            upstream_id,
+            tree_match_commit,
+            &cherry_equivalent,
+        )? {
+            prefix_end = last_tree_match;
+        }
+    }
+
+    let first_unmerged_idx = (prefix_end + 1) as usize;
+    if first_unmerged_idx >= first_parent_chain.len() {
+        return Ok(None);
+    }
+
+    let first_commit = first_parent_chain[first_unmerged_idx];
+
+    let first = repo.find_commit(first_commit)?;
+    if first.parent_count() == 0 {
+        return Err(anyhow!(
+            "Cannot restack from root commit {} without a parent base.",
+            first_commit
+        ));
+    }
+
+    Ok(Some(RestackBoundary {
+        old_base: first.parent_id(0)?,
+    }))
+}
+
+fn collect_first_parent_chain(
+    repo: &Repository,
+    ancestor_exclusive: Oid,
+    tip: Oid,
+) -> Result<Vec<Oid>> {
+    let mut chain = Vec::new();
+    let mut current = tip;
+
+    while current != ancestor_exclusive {
+        chain.push(current);
+        let commit = repo.find_commit(current)?;
+        if commit.parent_count() == 0 {
+            return Err(anyhow!(
+                "Failed to walk first-parent history from {} to merge-base {}.",
+                tip,
+                ancestor_exclusive
+            ));
+        }
+        current = commit.parent_id(0)?;
+    }
+
+    chain.reverse();
+    Ok(chain)
+}
+
+fn is_commit_in_upstream_or_patch_equivalent(
+    repo: &Repository,
+    upstream_id: Oid,
+    commit_id: Oid,
+    cherry_equivalent: &HashSet<Oid>,
+) -> Result<bool> {
+    let in_upstream = repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
+    Ok(in_upstream || cherry_equivalent.contains(&commit_id))
+}
+
+fn cherry_equivalent_commits(
+    repo: &Repository,
+    upstream_name: &str,
+    top_branch: &str,
+) -> Result<HashSet<Oid>> {
+    let output = Command::new("git")
+        .arg("cherry")
+        .arg(upstream_name)
+        .arg(top_branch)
+        .current_dir(repo_root(repo)?)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git cherry failed while computing restack boundary for '{}'.",
+            top_branch
+        ));
+    }
+
+    let mut result = HashSet::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let marker = parts.next().unwrap_or_default();
+        if marker != "-" {
+            continue;
+        }
+
+        if let Some(oid_text) = parts.next()
+            && let Ok(oid) = Oid::from_str(oid_text)
+        {
+            result.insert(oid);
+        }
+    }
+
+    Ok(result)
+}
+
+fn commits_with_trees_on_upstream(
+    repo: &Repository,
+    upstream_id: Oid,
+    commits: &[Oid],
+) -> Result<HashSet<Oid>> {
+    let mut tree_to_commits: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    for commit_id in commits {
+        let commit = repo.find_commit(*commit_id)?;
+        tree_to_commits
+            .entry(commit.tree_id())
+            .or_default()
+            .push(*commit_id);
+    }
+
+    let mut missing_tree_ids: HashSet<Oid> = tree_to_commits.keys().copied().collect();
+    let mut matched_commits = HashSet::new();
+
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    walk.push(upstream_id)?;
+
+    for id in walk {
+        let upstream_commit_id = id?;
+        let upstream_commit = repo.find_commit(upstream_commit_id)?;
+        let tree_id = upstream_commit.tree_id();
+        if !missing_tree_ids.remove(&tree_id) {
+            continue;
+        }
+
+        if let Some(commits_for_tree) = tree_to_commits.get(&tree_id) {
+            for commit_id in commits_for_tree {
+                matched_commits.insert(*commit_id);
+            }
+        }
+
+        if missing_tree_ids.is_empty() {
+            break;
+        }
+    }
+
+    Ok(matched_commits)
+}
+
+fn repo_root(repo: &Repository) -> Result<&Path> {
+    if let Some(workdir) = repo.workdir() {
+        return Ok(workdir);
+    }
+
+    repo.path()
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to resolve repository root path."))
 }
 
 pub fn get_stack_branches(

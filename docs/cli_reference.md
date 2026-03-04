@@ -8,6 +8,7 @@ This document provides a detailed overview of the commands available in `gits` a
 - [Command Reference](#command-reference)
   - [commit](#commit)
   - [move](#move)
+  - [restack](#restack)
   - [checkout (co)](`#checkout-alias-co`)
   - [push](#push)
   - [split](#split)
@@ -84,6 +85,28 @@ After gits move:
 main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
       \-> [D1] -> (develop)
 ```
+
+---
+
+### `restack`
+
+**Description:** Rebases the current stack onto the upstream branch (`main`/`master`) in a single rebase using `--update-refs`.
+
+**Usage:**
+
+```bash
+gits restack
+```
+
+**What it does:**
+
+- Finds the top branch in your current stack.
+- Detects the first commit that still needs replaying (while handling lower PRs already landed via merge, rebase/cherry-pick, or squash).
+- Checks out the top branch and runs one `git rebase --update-refs --onto <upstream> <old-base> <top>`.
+
+**When to use it:** Use this after one or more lower PRs in your stack have already landed on `main`, and you want to restack all remaining branches in one pass.
+
+**Conflict handling:** If rebase conflicts occur, resolve them and continue with `git rebase --continue` (or cancel with `git rebase --abort`).
 
 ---
 
