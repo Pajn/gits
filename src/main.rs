@@ -13,6 +13,7 @@ use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::pr::pr;
 use crate::commands::push::push;
+use crate::commands::restack::restack;
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
 pub use crate::repository::open_repo;
@@ -48,6 +49,8 @@ enum Commands {
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
+    /// Rebase the current stack onto the upstream branch in one pass
+    Restack,
     /// Commits and rebases dependent branches
     Commit {
         /// Arguments to pass to git commit
@@ -104,6 +107,7 @@ fn main() -> Result<()> {
         Commands::Commit { args } => commit(args)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
+        Commands::Restack => restack()?,
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,
         Commands::Status => status_cmd()?,

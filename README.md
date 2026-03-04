@@ -6,6 +6,7 @@
 
 - **Stacked Commits**: Automatically rebase all descendant branches when you commit in the middle of a stack.
 - **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch with a single command.
+- **Smart Restack**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.
 - **Atomic Pushes**: Push all branches in your stack simultaneously with `force-with-lease` safety.
@@ -29,6 +30,7 @@ cargo install --path .
 2. **Make a change**: Checkout a branch in the middle of the stack and run `gits commit`.
 3. **Watch the magic**: `gits` will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `gits move --onto main` to relocate the entire stack.
+5. **Restack after merges**: If lower PRs landed, run `gits restack` to rebase the remaining stack onto latest `main`.
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 
