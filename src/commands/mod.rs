@@ -12,6 +12,8 @@ pub mod status_cmd;
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use git2::{BranchType, Repository};
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 
 #[derive(Subcommand, Clone, Copy)]
@@ -64,20 +66,85 @@ pub fn prompt_confirm(message: &str) -> Result<bool> {
 }
 
 pub fn find_upstream(repo: &Repository) -> Result<String> {
-    let candidates = ["main", "master", "origin/main", "origin/master"];
-    for name in candidates {
-        if repo.revparse_single(name).is_ok() {
-            // Check if it's a local branch first
-            if repo.find_branch(name, BranchType::Local).is_ok() {
-                return Ok(name.to_string());
-            }
+    if let Some(upstream) = read_repo_upstream_override(repo)? {
+        if branch_exists(repo, &upstream) {
+            return Ok(upstream);
+        }
+        return Err(anyhow!(
+            "Configured upstream branch '{}' in .git/gits.toml was not found",
+            upstream
+        ));
+    }
+
+    let mut local_candidates = Vec::new();
+    if let Ok(default_branch) = repo.config()?.get_string("init.defaultBranch") {
+        let default_branch = default_branch.trim();
+        if !default_branch.is_empty() {
+            local_candidates.push(default_branch.to_string());
         }
     }
-    // Fallback to the first candidate that exists at all
-    for name in candidates {
-        if repo.revparse_single(name).is_ok() {
-            return Ok(name.to_string());
+    local_candidates.extend(["main", "master", "trunk"].iter().map(|s| s.to_string()));
+
+    let mut seen_local = HashSet::new();
+    local_candidates.retain(|candidate| seen_local.insert(candidate.clone()));
+
+    for name in &local_candidates {
+        if repo.find_branch(name, BranchType::Local).is_ok() {
+            return Ok(name.clone());
         }
     }
-    Err(anyhow!("Could not find a base branch (main or master)"))
+
+    let mut candidates = local_candidates.clone();
+    for name in &local_candidates {
+        if !name.starts_with("origin/") {
+            candidates.push(format!("origin/{name}"));
+        }
+    }
+    let mut seen_candidates = HashSet::new();
+    candidates.retain(|candidate| seen_candidates.insert(candidate.clone()));
+
+    for name in candidates {
+        if branch_exists(repo, &name) {
+            return Ok(name);
+        }
+    }
+
+    Err(anyhow!(
+        "Could not find a base branch (init.defaultBranch, main, master, or trunk)"
+    ))
+}
+
+fn branch_exists(repo: &Repository, name: &str) -> bool {
+    repo.find_branch(name, BranchType::Local).is_ok()
+        || repo.find_branch(name, BranchType::Remote).is_ok()
+}
+
+#[derive(Deserialize)]
+struct RepoConfig {
+    upstream_branch: Option<String>,
+}
+
+fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
+    let config_path = repo.path().join("gits.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "Failed to read repository config at {}",
+            config_path.display()
+        )
+    })?;
+    let cfg: RepoConfig = toml::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse repository config at {}",
+            config_path.display()
+        )
+    })?;
+
+    Ok(cfg
+        .upstream_branch
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
 }
