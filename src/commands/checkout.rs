@@ -1,6 +1,6 @@
 use super::CheckoutSubcommand;
 use super::find_upstream;
-use crate::stack::{get_immediate_successors, get_stack_branches, get_stack_tips, visualize_stack};
+use crate::stack::{get_immediate_successors, get_stack_tips, visualize_stack};
 use anyhow::{Result, anyhow};
 use git2::BranchType;
 use std::process::Command;
@@ -67,19 +67,20 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             }
         }
         Some(CheckoutSubcommand::Down) => {
-            let mut branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-            crate::stack::sort_branches_topologically(&repo, &mut branches)?;
-
             let current_name = current_branch_name.ok_or_else(|| anyhow!("Not on a branch"))?;
-            let idx = branches
-                .iter()
-                .position(|b| b.name == current_name)
-                .ok_or_else(|| anyhow!("Current branch '{}' not in stack", current_name))?;
+            let parent_branches =
+                find_first_parent_branches_via_git_log(&repo, &upstream_name, &current_name)?;
 
-            if idx > 0 {
-                perform_git_checkout(&branches[idx - 1].name)
-            } else {
-                perform_git_checkout(&upstream_name)
+            match parent_branches.len() {
+                0 => perform_git_checkout(&upstream_name),
+                1 => perform_git_checkout(&parent_branches[0]),
+                _ => {
+                    let selected = crate::commands::prompt_select(
+                        "Multiple parent branches found. Select one:",
+                        parent_branches,
+                    )?;
+                    perform_git_checkout(&selected)
+                }
             }
         }
         Some(CheckoutSubcommand::Top) => {
@@ -148,4 +149,76 @@ fn perform_git_checkout(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn find_first_parent_branches_via_git_log(
+    repo: &git2::Repository,
+    upstream_name: &str,
+    current_branch: &str,
+) -> Result<Vec<String>> {
+    let repo_root = if let Some(workdir) = repo.workdir() {
+        workdir.to_path_buf()
+    } else {
+        repo.path()
+            .parent()
+            .ok_or_else(|| anyhow!("Failed to resolve repository root path."))?
+            .to_path_buf()
+    };
+
+    let output = Command::new("git")
+        .args([
+            "log",
+            "--first-parent",
+            "--decorate=full",
+            "--format=%H%x00%D",
+            "HEAD",
+            &format!("^{upstream_name}"),
+        ])
+        .current_dir(repo_root)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to inspect first-parent ancestry via git log"
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut lines = stdout.lines();
+    let _ = lines.next();
+
+    for line in lines {
+        let mut parts = line.splitn(2, '\0');
+        let _commit = parts.next();
+        let decorations = parts.next().unwrap_or("");
+        let mut names = Vec::new();
+
+        for token in decorations.split(',') {
+            let item = token.trim();
+            if item.is_empty() {
+                continue;
+            }
+
+            let maybe_ref = if let Some(rest) = item.strip_prefix("HEAD -> ") {
+                rest.trim()
+            } else {
+                item
+            };
+
+            if let Some(local) = maybe_ref.strip_prefix("refs/heads/")
+                && local != current_branch
+                && local != upstream_name
+            {
+                names.push(local.to_string());
+            }
+        }
+
+        if !names.is_empty() {
+            names.sort();
+            names.dedup();
+            return Ok(names);
+        }
+    }
+
+    Ok(Vec::new())
 }

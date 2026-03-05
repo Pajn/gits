@@ -372,6 +372,68 @@ fn test_checkout_top_fork() {
 }
 
 #[test]
+fn test_checkout_down_moves_to_immediate_parent_branch() {
+    let (dir, repo) = setup_repo();
+
+    let feature_a_id = repo.revparse_single("HEAD~2").unwrap().id();
+    let feature_b_id = repo.revparse_single("HEAD~1").unwrap().id();
+    let feature_c_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    let feature_a = repo.find_commit(feature_a_id).unwrap();
+    let feature_b = repo.find_commit(feature_b_id).unwrap();
+    let feature_c = repo.find_commit(feature_c_id).unwrap();
+
+    repo.branch("feature-a", &feature_a, false).unwrap();
+    repo.branch("feature-b", &feature_b, false).unwrap();
+    repo.branch("feature-c", &feature_c, false).unwrap();
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("checkout")
+        .arg("down")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(new_head, "feature-a");
+}
+
+#[test]
+fn test_checkout_down_from_bottom_branch_goes_to_upstream() {
+    let (dir, repo) = setup_repo();
+
+    let feature_a_id = repo.revparse_single("HEAD~2").unwrap().id();
+    let feature_b_id = repo.revparse_single("HEAD~1").unwrap().id();
+    let feature_c_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    let feature_a = repo.find_commit(feature_a_id).unwrap();
+    let feature_b = repo.find_commit(feature_b_id).unwrap();
+    let feature_c = repo.find_commit(feature_c_id).unwrap();
+
+    repo.branch("feature-a", &feature_a, false).unwrap();
+    repo.branch("feature-b", &feature_b, false).unwrap();
+    repo.branch("feature-c", &feature_c, false).unwrap();
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("checkout")
+        .arg("down")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(new_head, "main");
+}
+
+#[test]
 fn test_split_fork_selection() {
     let (dir, repo) = setup_repo();
 
