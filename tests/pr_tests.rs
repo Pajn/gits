@@ -188,6 +188,9 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
     echo "https://github.com/test/repo/pull/1"
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    exit 0
+fi
 echo "mock gh: unexpected command: $@" >&2
 exit 1
 "#,
@@ -378,6 +381,9 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
     echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
     exit 0
 fi
 echo "mock gh: unexpected command: $@" >&2
@@ -584,6 +590,9 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
     echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
     exit 0
 fi
 echo "mock gh: unexpected command: $@" >&2

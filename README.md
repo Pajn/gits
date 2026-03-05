@@ -40,6 +40,20 @@ cargo install --path .
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 
+## Upstream Branch Selection
+
+Commands that need an upstream/base branch (for example `restack`, `split`, `push`, `commit`, and `move`) resolve it in this order:
+
+1. Repository override in `.git/gits.toml`:
+
+   ```toml
+   upstream_branch = "branch-name"
+   ```
+
+2. `git config init.defaultBranch`
+3. Built-in defaults: `main`, `master`, `trunk`
+4. Remote fallbacks: `origin/<branch>`
+
 ## Benchmarking
 
 Run the permanent Criterion benchmarks for stack navigation (`checkout top`, `co up`, `co down`) across two repository shapes:
