@@ -34,6 +34,17 @@ cargo install --path .
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 
+## Benchmarking
+
+Run the permanent Criterion benchmarks for stack navigation (`checkout top`, `co up`, `co down`) across two repository shapes:
+
+- 5,000 commits on `main` + 10,000 noise branches
+- 50,000 commits on `main` + 1,000 noise branches
+
+```bash
+cargo bench --bench checkout_top
+```
+
 ## Why gits?
 
 Traditional git workflows often involve large, monolithic Pull Requests or manual, error-prone rebasing when trying to keep multiple small, dependent PRs in sync. `gits` treats your branches as a **stack**, allowing you to focus on small, reviewable increments of code while it handles the plumbing.
