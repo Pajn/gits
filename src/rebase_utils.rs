@@ -58,6 +58,14 @@ pub struct RebaseState {
     /// recorded index state was actually removed from the tree.
     #[serde(default)]
     pub stash_apply_index: bool,
+    /// Second, short-lived stash token holding the staged content `kin commit
+    /// --on` carries across a branch switch (see `carry_staged_changes_onto`).
+    /// It is set only between the push and the apply that lands it on the target
+    /// branch — every path out of the carry clears it again — so a value found
+    /// here means a run was interrupted mid-carry and `kin abort` has to put
+    /// those staged changes back.
+    #[serde(default)]
+    pub carry_stash_ref: Option<String>,
     /// Whether `kin abort` must preserve content the operation already
     /// committed (absorb: the fixup/folded commits). When set, abort checks
     /// out the original branch and applies the stash *before* restoring the

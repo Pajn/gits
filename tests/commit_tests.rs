@@ -1,5 +1,7 @@
 mod common;
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    assert_no_rebase_in_progress, current_branch, kin_cmd, make_commit, repo_init, run_ok,
+};
 use git2::Repository;
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
 use std::collections::HashMap;
@@ -79,6 +81,7 @@ fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
         owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
         stash_ref: Some(stash_ref.to_string()),
         stash_apply_index: false,
+        carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
         unstage_on_restore: false,
@@ -1941,78 +1944,576 @@ fn test_rebase_loop_skips_resumed_and_subsequent_done_branches() {
     assert!(repo.graph_descendant_of(new_b_id, new_a_id).unwrap());
 }
 
-#[test]
-fn test_commit_on_checkout_conflict_restores_original_context() {
-    let (dir, repo) = setup_repo();
-    let main_id = repo.revparse_single("main").unwrap().id();
-    let main_commit = repo.find_commit(main_id).unwrap();
+/// A stack whose branches each edit a different line of the same numbered file,
+/// so a staged change to a third line is carried across a *diverged* file — the
+/// shape `git checkout` refuses outright.
+fn setup_diverged_line_stack(dir: &Path) {
+    let numbered: String = (1..=40).map(|n| format!("{n}\n")).collect();
+    fs::write(dir.join("f.txt"), &numbered).unwrap();
+    run_ok("git", &["add", "f.txt"], dir);
+    run_ok("git", &["commit", "-m", "base"], dir);
+    run_ok("git", &["checkout", "-b", "lower"], dir);
+    edit_line(dir, 5, "5-lower");
+    run_ok("git", &["commit", "-am", "lower edit"], dir);
+    run_ok("git", &["checkout", "-b", "upper"], dir);
+    edit_line(dir, 30, "30-upper");
+    run_ok("git", &["commit", "-am", "upper edit"], dir);
+}
 
-    let a_id = make_commit(
-        &repo,
-        "refs/heads/feature-a",
-        "shared.txt",
-        "feature-a base",
-        "feature-a",
-        &[&main_commit],
-    );
-    let a_commit = repo.find_commit(a_id).unwrap();
-    let _b_id = make_commit(
-        &repo,
-        "refs/heads/feature-b",
-        "shared.txt",
-        "feature-b base",
-        "feature-b",
-        &[&a_commit],
-    );
+/// Replace the `line`th line of `f.txt` with `replacement`.
+fn edit_line(dir: &Path, line: usize, replacement: &str) {
+    let path = dir.join("f.txt");
+    let mut lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    lines[line - 1] = replacement.to_string();
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+}
 
-    repo.set_head("refs/heads/feature-b").unwrap();
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+/// Write `f.txt` as the numbered file with `edits` applied. Conflicts are
+/// resolved by stating the intended content outright rather than editing around
+/// conflict markers, so a resolution does not depend on how git rendered them.
+fn write_numbered_file(dir: &Path, edits: &[(usize, &str)]) {
+    let mut lines: Vec<String> = (1..=40).map(|n| n.to_string()).collect();
+    for (line, replacement) in edits {
+        lines[line - 1] = (*replacement).to_string();
+    }
+    fs::write(dir.join("f.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+fn file_line(dir: &Path, revision: &str, line: usize) -> String {
+    let content = git_stdout(dir, &["show", &format!("{revision}:f.txt")]);
+    content.lines().nth(line - 1).unwrap().to_string()
+}
+
+/// `git checkout` must refuse to carry the staged changes to the target branch,
+/// so the tests below cover what Kindra does *instead* of that checkout.
+fn assert_checkout_would_be_refused(dir: &Path, branch: &str) {
+    let out = std::process::Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(dir)
+        // The assertion below reads git's own refusal, so pin the locale: a
+        // localized git build would translate it.
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .output()
         .unwrap();
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("would be overwritten by checkout"),
+        "expected 'git checkout {branch}' to refuse the staged changes, got:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
 
-    fs::write(
-        dir.path().join("shared.txt"),
-        "local staged change that blocks checkout",
-    )
-    .unwrap();
-    run_ok("git", &["add", "shared.txt"], dir.path());
-    fs::write(dir.path().join("scratch.txt"), "scratch").unwrap();
+/// Committing onto an ancestor branch never switches branches: the commit is
+/// made here and replayed onto the target, so a staged path that merely differs
+/// on the target — the case `git checkout` refuses — moves down all the same.
+#[test]
+fn test_commit_on_ancestor_moves_commit_without_switching_branches() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
 
-    let mut cmd = kin_cmd();
-    cmd.arg("commit")
-        .arg("--on")
-        .arg("feature-a")
-        .arg("-m")
-        .arg("should fail before commit")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", "true")
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "git checkout failed for branch 'feature-a'",
-        ));
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+    assert_checkout_would_be_refused(repo_path, "lower");
 
-    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-b");
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
-
-    // Abort should clean up the state and restore context
-    let mut abort_cmd = kin_cmd();
-    abort_cmd
-        .arg("abort")
-        .current_dir(dir.path())
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
         .assert()
         .success();
 
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    // The commit landed on the target, which is still an ancestor of the branch
+    // we never left, and both branches kept their own edits.
+    assert_eq!(current_branch(repo_path), "upper");
     assert_eq!(
-        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
-        "scratch"
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "lower"]).trim(),
+        "onto lower"
     );
-    assert_has_unstaged_file(dir.path(), "scratch.txt");
-    assert_no_staged_changes(dir.path());
+    assert_eq!(file_line(repo_path, "lower", 20), "20-staged");
+    assert_eq!(file_line(repo_path, "lower", 5), "5-lower");
+    assert_eq!(file_line(repo_path, "upper", 30), "30-upper");
+    assert_eq!(file_line(repo_path, "upper", 20), "20-staged");
+
+    // Not switching branches is the point, so hold the line on it: a checkout of
+    // the target would have been refused, and there is no trace of one.
+    let reflog = git_stdout(repo_path, &["reflog", "show", "HEAD"]);
+    assert!(
+        !reflog.contains("checkout: moving from upper to lower"),
+        "the target branch must never be checked out:\n{reflog}"
+    );
+
+    // The set-aside working tree came back exactly as it was.
+    assert_has_unstaged_file(repo_path, "f.txt");
+    assert_no_staged_changes(repo_path);
+    assert!(
+        fs::read_to_string(repo_path.join("f.txt"))
+            .unwrap()
+            .contains("35-unstaged")
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+}
+
+/// The replay rewrites everything between the target and HEAD, and the rebase
+/// loop restacks what sits above it, so every branch of the stack follows the
+/// moved commit.
+#[test]
+fn test_commit_on_ancestor_moves_branches_in_and_above_the_range() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    // lower -> mid -> upper -> top, with `upper` checked out.
+    run_ok("git", &["checkout", "-b", "top"], repo_path);
+    edit_line(repo_path, 38, "38-top");
+    run_ok("git", &["commit", "-am", "top edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+    run_ok("git", &["checkout", "-b", "mid", "lower"], repo_path);
+    edit_line(repo_path, 12, "12-mid");
+    run_ok("git", &["commit", "-am", "mid edit"], repo_path);
+    run_ok("git", &["rebase", "mid", "upper"], repo_path);
+    run_ok("git", &["rebase", "upper", "top"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    assert_checkout_would_be_refused(repo_path, "lower");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .assert()
+        .success();
+
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "lower"]).trim(),
+        "onto lower"
+    );
+    // Every branch carries the moved change, and each kept its own edit: the
+    // in-range ones moved with `--update-refs`, `top` with the restack.
+    for branch in ["lower", "mid", "upper", "top"] {
+        assert_eq!(
+            file_line(repo_path, branch, 20),
+            "20-staged",
+            "branch '{branch}' did not follow the moved commit"
+        );
+    }
+    assert_eq!(file_line(repo_path, "mid", 12), "12-mid");
+    assert_eq!(file_line(repo_path, "top", 38), "38-top");
+    assert_eq!(file_line(repo_path, "top", 30), "30-upper");
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+}
+
+/// A `git commit` that fails takes the whole operation with it: the move path
+/// has nothing to recover before its commit exists, so it must leave no state
+/// file, no stash, and no moved branch behind.
+#[test]
+fn test_commit_on_ancestor_commit_failure_does_not_persist_state() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    let lower_tip = git_stdout(repo_path, &["rev-parse", "lower"])
+        .trim()
+        .to_string();
+    let upper_tip = git_stdout(repo_path, &["rev-parse", "upper"])
+        .trim()
+        .to_string();
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    let hook_path = repo_path.join(".git/hooks/pre-commit");
+    fs::write(&hook_path, "#!/bin/sh\nexit 1\n").unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-commit"], repo_path);
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git commit failed"));
+
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "lower"]).trim(),
+        lower_tip
+    );
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "upper"]).trim(),
+        upper_tip
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    assert!(
+        git_stdout(repo_path, &["diff", "--cached"]).contains("20-staged"),
+        "the staged changes must be left staged and untouched"
+    );
+}
+
+/// A branch hanging off the middle of the stack is moved by neither the replay's
+/// `--update-refs` (its tip is outside the rewritten range) nor the restack that
+/// follows (it does not descend from HEAD), so the no-checkout path steps aside
+/// for the branch switch, which restacks the whole sub-stack instead.
+#[test]
+fn test_commit_on_ancestor_defers_to_the_switch_for_a_branch_forking_inside_the_range() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    // lower -> mid -> upper, plus `offshoot` forking off mid.
+    run_ok("git", &["checkout", "-b", "mid", "lower"], repo_path);
+    edit_line(repo_path, 12, "12-mid");
+    run_ok("git", &["commit", "-am", "mid edit"], repo_path);
+    run_ok("git", &["rebase", "mid", "upper"], repo_path);
+    run_ok("git", &["checkout", "-b", "offshoot", "mid"], repo_path);
+    edit_line(repo_path, 25, "25-offshoot");
+    run_ok("git", &["commit", "-am", "offshoot edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower", "--yes"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "lower"]).trim(),
+        "onto lower"
+    );
+    // The offshoot followed the rewritten `mid` rather than being left behind on
+    // pre-move history — the whole point of stepping aside for the switch.
+    for branch in ["mid", "upper", "offshoot"] {
+        assert_eq!(
+            file_line(repo_path, branch, 20),
+            "20-staged",
+            "branch '{branch}' did not follow the commit onto 'lower'"
+        );
+    }
+    assert_eq!(file_line(repo_path, "offshoot", 25), "25-offshoot");
+    let mid_tip = git_stdout(repo_path, &["rev-parse", "mid"])
+        .trim()
+        .to_string();
+    let offshoot_parent = git_stdout(repo_path, &["rev-parse", "offshoot^"])
+        .trim()
+        .to_string();
+    assert_eq!(offshoot_parent, mid_tip);
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+}
+
+/// The other way out of a conflicted move: resolve and run `kin continue` until
+/// the replay finishes. Moving a change down past the commit it was written on
+/// top of stops once for the moved commit and once for each replayed commit that
+/// touches the same lines, so this drives the stops until there are none left.
+#[test]
+fn test_commit_on_ancestor_conflict_can_be_finished_with_continue() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+
+    // Line 30 is `upper`'s own edit, so replaying a staged change to it onto
+    // `lower` — which never saw that edit — cannot apply cleanly.
+    edit_line(repo_path, 30, "30-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "conflicting move"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("kin continue"));
+    assert!(repo_path.join(".git/rebase-merge").exists());
+
+    // Each stop is resolved to content of its own, so no replayed commit becomes
+    // empty and every `kin continue` has real work to finish.
+    let mut stops = 0;
+    while repo_path.join(".git/rebase-merge").exists() {
+        stops += 1;
+        assert!(
+            stops <= 3,
+            "the move stopped more often than it has commits to replay"
+        );
+        write_numbered_file(
+            repo_path,
+            &[(5, "5-lower"), (30, &format!("30-resolved-{stops}"))],
+        );
+        run_ok("git", &["add", "f.txt"], repo_path);
+        // Only the last continue finishes; the earlier ones stop on the next
+        // conflict, which the loop resolves in turn. Which of the two happened
+        // has to match the exit status, or a `kin continue` that failed for some
+        // other reason would pass for progress.
+        let out = kin_cmd()
+            .current_dir(repo_path)
+            .arg("continue")
+            .output()
+            .unwrap();
+        if repo_path.join(".git/rebase-merge").exists() {
+            assert!(
+                !out.status.success(),
+                "a stop on the next conflict must be reported as a failure\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            assert!(
+                out.status.success(),
+                "the continue that finishes the move must succeed\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    assert!(stops >= 2, "expected a stop per conflicting commit");
+
+    // The operation ran to completion: the commit is on the target, the branch we
+    // never left follows it, and nothing is left in progress.
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "lower"]).trim(),
+        "conflicting move"
+    );
+    assert_eq!(file_line(repo_path, "lower", 30), "30-resolved-1");
+    let lower_tip = git_stdout(repo_path, &["rev-parse", "lower"])
+        .trim()
+        .to_string();
+    assert!(
+        git_stdout(
+            repo_path,
+            &["merge-base", "--is-ancestor", &lower_tip, "upper"]
+        )
+        .is_empty(),
+        "'upper' must descend from the moved commit"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    // Not `assert_no_rebase_in_progress`: git leaves `REBASE_HEAD` behind after
+    // any rebase that stopped, resolved or not, and clears it on the next one.
+    assert!(!repo_path.join(".git/rebase-merge").exists());
+    assert!(!repo_path.join(".git/rebase-apply").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    // The set-aside unstaged edit came back with the operation.
+    assert!(
+        fs::read_to_string(repo_path.join("f.txt"))
+            .unwrap()
+            .contains("35-unstaged")
+    );
+}
+
+/// A staged change that genuinely conflicts with the target reaches the user as
+/// a paused rebase, which `kin abort` takes back to exactly the state they
+/// started in: commit undone, changes staged again.
+/// (`test_commit_on_ancestor_conflict_can_be_finished_with_continue` covers
+/// driving the same stop forward instead.)
+#[test]
+fn test_commit_on_ancestor_conflict_can_be_aborted() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    let lower_tip = git_stdout(repo_path, &["rev-parse", "lower"])
+        .trim()
+        .to_string();
+    let upper_tip = git_stdout(repo_path, &["rev-parse", "upper"])
+        .trim()
+        .to_string();
+
+    // Stage a change to the very line `upper` edited: replaying it onto `lower`,
+    // which never saw that edit, cannot apply cleanly.
+    edit_line(repo_path, 30, "30-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "conflicting move"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("kin continue"))
+        .stderr(predicates::str::contains("kin abort"));
+
+    assert!(repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(repo_path.join(".git/rebase-merge").exists());
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("abort")
+        .assert()
+        .success();
+
+    // Both branches are back where they were, and the content the commit held is
+    // staged again — nothing was lost to the undone commit.
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "lower"]).trim(),
+        lower_tip
+    );
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "upper"]).trim(),
+        upper_tip
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(
+        git_stdout(repo_path, &["diff", "--cached"]).contains("30-staged"),
+        "the aborted commit's content must come back staged"
+    );
+    assert!(
+        git_stdout(repo_path, &["diff"]).contains("35-unstaged"),
+        "the set-aside unstaged edit must come back unstaged"
+    );
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+}
+
+/// An unstaged edit that overlaps the committed change is kept as an unstaged
+/// edit on top of the commit, the way a plain `git commit` of a staged hunk
+/// leaves a newer edit of the same line alone.
+#[test]
+fn test_commit_on_ancestor_keeps_an_overlapping_unstaged_edit() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 20, "20-unstaged");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .assert()
+        .success();
+
+    assert_eq!(file_line(repo_path, "lower", 20), "20-staged");
+    assert!(
+        fs::read_to_string(repo_path.join("f.txt"))
+            .unwrap()
+            .contains("20-unstaged"),
+        "the overlapping unstaged edit must survive the move"
+    );
+    assert_no_staged_changes(repo_path);
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+}
+
+/// Committing onto a branch outside this stack still switches to it, and still
+/// has to take the staged changes along. `git checkout` refuses that whenever a
+/// staged path differs on the target, so the changes travel in a stash and are
+/// merged back on the other side.
+#[test]
+fn test_commit_on_sibling_carries_staged_changes_past_a_refused_checkout() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "other", "main"], repo_path);
+    edit_line(repo_path, 10, "10-other");
+    run_ok("git", &["commit", "-am", "other edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+    assert_checkout_would_be_refused(repo_path, "other");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "other", "-m", "onto other"])
+        .assert()
+        .success();
+
+    // The commit landed on the sibling with both edits, and we are back home.
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "other"]).trim(),
+        "onto other"
+    );
+    assert_eq!(file_line(repo_path, "other", 20), "20-staged");
+    assert_eq!(file_line(repo_path, "other", 10), "10-other");
+    assert_eq!(file_line(repo_path, "upper", 20), "20");
+
+    assert_no_staged_changes(repo_path);
+    assert_has_unstaged_file(repo_path, "f.txt");
+    assert!(
+        fs::read_to_string(repo_path.join("f.txt"))
+            .unwrap()
+            .contains("35-unstaged")
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+}
+
+/// Carrying the staged changes onto a branch they genuinely conflict with is the
+/// one case the switch cannot serve. It unwinds completely: back on the original
+/// branch, changes as they were, nothing left to abort.
+#[test]
+fn test_commit_on_sibling_conflict_unwinds_to_the_original_context() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "other", "main"], repo_path);
+    edit_line(repo_path, 30, "30-other");
+    run_ok("git", &["commit", "-am", "other edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+    let other_tip = git_stdout(repo_path, &["rev-parse", "other"])
+        .trim()
+        .to_string();
+    let upper_tip = git_stdout(repo_path, &["rev-parse", "upper"])
+        .trim()
+        .to_string();
+
+    // Line 30 is `upper`'s own edit and `other` changed it too: the staged change
+    // to it cannot be applied on `other` without a conflict.
+    edit_line(repo_path, 30, "30-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "other", "-m", "should not land"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("conflict with 'other'"));
+
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "other"]).trim(),
+        other_tip
+    );
+    assert_eq!(
+        git_stdout(repo_path, &["rev-parse", "upper"]).trim(),
+        upper_tip
+    );
+    assert!(
+        git_stdout(repo_path, &["diff", "--cached"]).contains("30-staged"),
+        "the staged changes must be staged again after the unwind"
+    );
+    assert!(
+        git_stdout(repo_path, &["diff"]).contains("35-unstaged"),
+        "the unstaged edit must come back unstaged"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    assert_no_rebase_in_progress(repo_path);
 }
 
 #[test]
@@ -4142,6 +4643,12 @@ fn test_continue_recovers_from_failed_pick_commit_during_fold() {
 /// A conflicted restore of the set-aside stash at the end of `kin commit --on`
 /// must leave the operation resumable and abortable, not clear the state out
 /// from under the user.
+///
+/// `--amend` puts this on the branch-switching path, where the unstaged edit is
+/// set aside *before* the commit, so restoring it afterwards has to contend with
+/// what landed in between. (A plain `--on` an ancestor branch never switches and
+/// sets the edit aside after committing, so the same overlap resolves quietly —
+/// `test_commit_on_ancestor_keeps_an_overlapping_unstaged_edit` covers that.)
 #[test]
 fn test_commit_on_conflicted_stash_restore_stays_resumable() {
     let dir = tempdir().unwrap();
@@ -4185,7 +4692,14 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
     let mut cmd = kin_cmd();
     let output = cmd
         .current_dir(repo_path)
-        .args(["commit", "--on", "lower", "-m", "folded into lower"])
+        .args([
+            "commit",
+            "--on",
+            "lower",
+            "--amend",
+            "-m",
+            "folded into lower",
+        ])
         .output()
         .unwrap();
     assert!(

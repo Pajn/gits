@@ -257,6 +257,7 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         // The stash below is a full stash (no --keep-index), so restoring it
         // with --index brings unabsorbable staged hunks back *staged*.
         stash_apply_index: true,
+        carry_stash_ref: None,
         // The absorbed changes live only in the fixup/folded commits; if `kin
         // abort` discards that history, it must first let the worktree keep
         // the content so it reappears as staged changes instead of being lost.

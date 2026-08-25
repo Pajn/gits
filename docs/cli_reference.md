@@ -130,7 +130,14 @@ Parser behavior:
 - `kin commit --on -m "msg"`: invalid, because `--on` expects a branch unless used as the final token.
 - Use `kin commit --on= -m "msg"` (or `kin commit --on` as the last token) for interactive selection.
 
-When committing onto another branch, Kindra stashes non-staged files, switches to the target branch, commits, rebases dependents (unless you choose not to for an external stack), then returns to your original branch and unstages.
+When committing onto another branch, Kindra sets your non-staged files aside, commits the staged changes on the target branch, rebases dependents (unless you choose not to for an external stack), and restores the working tree when it finishes.
+
+How it gets the commit there depends on where the target is:
+
+- **A branch below you in the stack** (the usual case): no branch switch at all. The commit is made where you are and replayed onto the target, moving that branch and everything stacked above it in one pass, and you stay on your branch throughout. A conflict between your staged changes and the target stops the replay as a paused rebase: resolve it and run `kin continue`, or `kin abort` to undo the commit and get the changes back staged.
+- **Any other branch** — a sibling stack, the trunk, an `--amend` of the target's tip, or a lower branch whose sub-stack the replay cannot move on its own (another branch forks off inside the stretch being replayed, so the switch handles the whole sub-stack instead): Kindra switches to the target, carrying the staged changes along, and returns you to your original branch afterwards, unstaging as it goes. A conflict here unwinds the operation and leaves you exactly where you started.
+
+Either way the staged changes travel by merge, not by copy, so a file the target branch also changed is no obstacle — only a genuine conflict with the target stops the operation.
 
 **When to use it:** Use this instead of `git commit` when you are working on a branch that has other branches building on top of it. It saves you from having to manually rebase each dependent branch.
 

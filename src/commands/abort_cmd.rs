@@ -164,6 +164,7 @@ fn apply_abort_stash(
     repo: &git2::Repository,
     parsed_state: &mut crate::rebase_utils::RebaseState,
 ) -> Result<()> {
+    apply_abort_carry_stash(repo, parsed_state)?;
     let Some(stash_ref) = parsed_state.stash_ref.clone() else {
         return Ok(());
     };
@@ -183,6 +184,41 @@ fn apply_abort_stash(
             eprintln!(
                 "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
                 stash_ref
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Restore the staged changes `kin commit --on` was carrying across a branch
+/// switch when it was interrupted mid-carry.
+///
+/// The carry is a handful of git commands long and clears this field on every
+/// path out of it, so a value here means the process died inside that window.
+/// The entry was taken on the branch this abort has just returned to, so it
+/// applies cleanly there; it goes back *before* the operation's own stash, whose
+/// snapshot also contains this content and would otherwise deliver it unstaged.
+fn apply_abort_carry_stash(
+    repo: &git2::Repository,
+    parsed_state: &mut crate::rebase_utils::RebaseState,
+) -> Result<()> {
+    let Some(carry_stash) = parsed_state.carry_stash_ref.clone() else {
+        return Ok(());
+    };
+    match crate::rebase_utils::apply_stash_with_outcome(&carry_stash, true)? {
+        StashApplyOutcome::Applied => {
+            parsed_state.carry_stash_ref = None;
+            save_state(repo, parsed_state)?;
+            if let Err(err) = drop_stash(&carry_stash) {
+                eprintln!("Warning: {}", err);
+            }
+        }
+        StashApplyOutcome::ConflictsLeftInTree => {
+            parsed_state.carry_stash_ref = None;
+            save_state(repo, parsed_state)?;
+            eprintln!(
+                "Warning: restoring the staged changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
+                carry_stash
             );
         }
     }
