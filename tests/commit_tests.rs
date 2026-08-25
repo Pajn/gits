@@ -1972,6 +1972,17 @@ fn edit_line(dir: &Path, line: usize, replacement: &str) {
     fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
 }
 
+/// Write `f.txt` as the numbered file with `edits` applied. Conflicts are
+/// resolved by stating the intended content outright rather than editing around
+/// conflict markers, so a resolution does not depend on how git rendered them.
+fn write_numbered_file(dir: &Path, edits: &[(usize, &str)]) {
+    let mut lines: Vec<String> = (1..=40).map(|n| n.to_string()).collect();
+    for (line, replacement) in edits {
+        lines[line - 1] = (*replacement).to_string();
+    }
+    fs::write(dir.join("f.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+}
+
 fn file_line(dir: &Path, revision: &str, line: usize) -> String {
     let content = git_stdout(dir, &["show", &format!("{revision}:f.txt")]);
     content.lines().nth(line - 1).unwrap().to_string()
@@ -1983,6 +1994,10 @@ fn assert_checkout_would_be_refused(dir: &Path, branch: &str) {
     let out = std::process::Command::new("git")
         .args(["checkout", branch])
         .current_dir(dir)
+        // The assertion below reads git's own refusal, so pin the locale: a
+        // localized git build would translate it.
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
         .output()
         .unwrap();
     assert!(
@@ -2202,11 +2217,91 @@ fn test_commit_on_ancestor_defers_to_the_switch_for_a_branch_forking_inside_the_
     assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
 }
 
-/// A staged change that genuinely conflicts with the target reaches the user as
-/// a paused rebase: resumable with `kin continue`, and abortable back to exactly
-/// the state they started in, commit undone and changes staged again.
+/// The other way out of a conflicted move: resolve and run `kin continue` until
+/// the replay finishes. Moving a change down past the commit it was written on
+/// top of stops once for the moved commit and once for each replayed commit that
+/// touches the same lines, so this drives the stops until there are none left.
 #[test]
-fn test_commit_on_ancestor_conflict_is_resumable_then_abortable() {
+fn test_commit_on_ancestor_conflict_can_be_finished_with_continue() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+
+    // Line 30 is `upper`'s own edit, so replaying a staged change to it onto
+    // `lower` — which never saw that edit — cannot apply cleanly.
+    edit_line(repo_path, 30, "30-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "conflicting move"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("kin continue"));
+    assert!(repo_path.join(".git/rebase-merge").exists());
+
+    // Each stop is resolved to content of its own, so no replayed commit becomes
+    // empty and every `kin continue` has real work to finish.
+    let mut stops = 0;
+    while repo_path.join(".git/rebase-merge").exists() {
+        stops += 1;
+        assert!(
+            stops <= 3,
+            "the move stopped more often than it has commits to replay"
+        );
+        write_numbered_file(
+            repo_path,
+            &[(5, "5-lower"), (30, &format!("30-resolved-{stops}"))],
+        );
+        run_ok("git", &["add", "f.txt"], repo_path);
+        // Only the last continue finishes; the earlier ones stop on the next
+        // conflict, which the loop resolves in turn.
+        let _ = kin_cmd().current_dir(repo_path).arg("continue").output();
+    }
+    assert!(stops >= 2, "expected a stop per conflicting commit");
+
+    // The operation ran to completion: the commit is on the target, the branch we
+    // never left follows it, and nothing is left in progress.
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(
+        git_stdout(repo_path, &["log", "-1", "--format=%s", "lower"]).trim(),
+        "conflicting move"
+    );
+    assert_eq!(file_line(repo_path, "lower", 30), "30-resolved-1");
+    let lower_tip = git_stdout(repo_path, &["rev-parse", "lower"])
+        .trim()
+        .to_string();
+    assert!(
+        git_stdout(
+            repo_path,
+            &["merge-base", "--is-ancestor", &lower_tip, "upper"]
+        )
+        .is_empty(),
+        "'upper' must descend from the moved commit"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    // Not `assert_no_rebase_in_progress`: git leaves `REBASE_HEAD` behind after
+    // any rebase that stopped, resolved or not, and clears it on the next one.
+    assert!(!repo_path.join(".git/rebase-merge").exists());
+    assert!(!repo_path.join(".git/rebase-apply").exists());
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    // The set-aside unstaged edit came back with the operation.
+    assert!(
+        fs::read_to_string(repo_path.join("f.txt"))
+            .unwrap()
+            .contains("35-unstaged")
+    );
+}
+
+/// A staged change that genuinely conflicts with the target reaches the user as
+/// a paused rebase, which `kin abort` takes back to exactly the state they
+/// started in: commit undone, changes staged again.
+/// (`test_commit_on_ancestor_conflict_can_be_finished_with_continue` covers
+/// driving the same stop forward instead.)
+#[test]
+fn test_commit_on_ancestor_conflict_can_be_aborted() {
     let dir = tempdir().unwrap();
     let repo_path = dir.path();
     repo_init(repo_path);
