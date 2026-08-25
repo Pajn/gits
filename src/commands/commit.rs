@@ -1,7 +1,8 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
-    RebaseState, apply_stash, check_worktrees, checkout_branch, clear_state, drop_stash,
-    git_rebase_in_progress, passively_reconcile_rebase_state, record_branch_tips_in_range,
+    RebaseState, StashApplyOutcome, apply_stash, apply_stash_with_outcome, check_worktrees,
+    checkout_branch, clear_state, drop_stash, git_rebase_in_progress,
+    passively_reconcile_rebase_state, record_branch_tips_in_range, restore_set_aside_changes,
     restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{
@@ -126,7 +127,7 @@ pub fn commit(args: &[String]) -> Result<()> {
         return Err(anyhow!("nothing to commit, working tree clean"));
     }
 
-    let target_branch = match &interactive_selection {
+    let requested_target = match &interactive_selection {
         // An inline fixup stays on the current branch: it folds into an ancestor
         // and restacks descendants, never switching to the target's branch.
         Some(_) if inline_fixup => current_branch_name.clone(),
@@ -143,9 +144,43 @@ pub fn commit(args: &[String]) -> Result<()> {
         },
     };
 
-    repo.find_branch(&target_branch, BranchType::Local)
-        .with_context(|| format!("Target branch '{}' not found.", target_branch))?;
-    let target_old_head_id = repo.revparse_single(&target_branch)?.id();
+    repo.find_branch(&requested_target, BranchType::Local)
+        .with_context(|| format!("Target branch '{}' not found.", requested_target))?;
+    let requested_target_old_head_id = repo.revparse_single(&requested_target)?.id();
+
+    // `--on` an ancestor branch needs no branch switch at all: commit here, then
+    // let an `--update-refs` rebase replay `<target>..HEAD` with the new commit
+    // moved to the bottom, which claims the target's ref for it. Same in-place
+    // technique as an inline fixup, and for the same reason — carrying staged
+    // changes across a diverged tree is what `git checkout` refuses to do.
+    let ancestor_on_target = ancestor_move_target(
+        &repo,
+        &parsed,
+        interactive_selection.is_some(),
+        &requested_target,
+        requested_target_old_head_id,
+        &current_branch_name,
+        head_id,
+        &upstream_name,
+        upstream_id,
+        &current_stack.stack_branches,
+    )?;
+    let moving_onto_ancestor = ancestor_on_target.is_some();
+
+    // On the no-checkout path the operation's shape is an in-place rewrite of the
+    // current branch, so all the bookkeeping below (sub-stack, parent maps, the
+    // rebase loop that restacks what sits above HEAD) is that of the current
+    // branch. The requested target only re-enters when the rebase todo claims it.
+    let target_branch = if moving_onto_ancestor {
+        current_branch_name.clone()
+    } else {
+        requested_target.clone()
+    };
+    let target_old_head_id = if moving_onto_ancestor {
+        head_id
+    } else {
+        requested_target_old_head_id
+    };
     let target_in_current_context = target_branch == upstream_name
         || current_stack
             .stack_branches
@@ -188,23 +223,42 @@ pub fn commit(args: &[String]) -> Result<()> {
     let will_rebase = should_rebase && target_has_dependents && !remaining_branches.is_empty();
     let needs_autosquash = is_fixup;
     let autosquash_state_required = needs_autosquash && !switching_branches && !will_rebase;
+    // The move rebase always needs saved state (it stashes and rewrites branch
+    // tips); this is the flag for the case where no dependent restack follows, so
+    // the tail work the rebase loop would otherwise do falls to us.
+    let move_state_required = moving_onto_ancestor && !will_rebase;
 
     // The check_worktrees call must run before the code path that performs the commit and
     // mutates target_branch so failures don't leave state unpersisted.
     if will_rebase || needs_autosquash {
         check_worktrees(&remaining_branches, parsed.force)?;
     }
+    // The move rebase rewrites the branches between the target and HEAD as well,
+    // which the dependent list above does not cover.
+    if let Some(ancestor_target) = &ancestor_on_target {
+        let in_range: Vec<String> = crate::rebase_utils::local_branch_tips_in_range(
+            &repo,
+            Some(requested_target_old_head_id),
+            head_id,
+        )?
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &current_branch_name)
+        .chain(std::iter::once(ancestor_target.clone()))
+        .collect();
+        check_worktrees(&in_range, parsed.force)?;
+    }
 
-    // The autosquash below rewrites branch tips with `--update-refs` (git >= 2.38).
-    // Verify support up front, before `git commit` creates a `fixup!` commit or
-    // any state is stashed/saved, so an unsupported git fails cleanly with nothing
-    // left to undo.
-    if needs_autosquash {
+    // The autosquash and move rebases below rewrite branch tips with
+    // `--update-refs` (git >= 2.38). Verify support up front, before `git commit`
+    // creates a commit or any state is stashed/saved, so an unsupported git fails
+    // cleanly with nothing left to undo.
+    if needs_autosquash || moving_onto_ancestor {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
     }
 
     let pre_commit_state_required = switching_branches || will_rebase;
-    if pre_commit_state_required || needs_autosquash {
+    if pre_commit_state_required || needs_autosquash || moving_onto_ancestor {
         let (parent_id_map, parent_name_map) = if will_rebase {
             crate::stack::build_parent_maps(
                 &repo,
@@ -265,7 +319,11 @@ pub fn commit(args: &[String]) -> Result<()> {
             owned_tip_map: HashMap::new(),
             stash_ref: None,
             stash_apply_index: false,
-            preserve_content_on_abort: false,
+            carry_stash_ref: None,
+            // The move path commits before it rewrites anything, so an abort at
+            // any point after that must hand the content back (as staged changes)
+            // rather than drop it with the commit.
+            preserve_content_on_abort: moving_onto_ancestor,
             suppress_editor: false,
             unstage_on_restore: switching_branches,
             autostash,
@@ -283,6 +341,9 @@ pub fn commit(args: &[String]) -> Result<()> {
             state.stash_ref = stash_non_staged_changes()?;
         }
 
+        // The move path has nothing to recover until its commit exists, so it
+        // saves its state after committing (below) rather than here — a `git
+        // commit` that fails must not leave a state file behind.
         if pre_commit_state_required && let Err(err) = save_state(&repo, &state) {
             // Persisting failed, so no later `kin continue`/`abort` knows about
             // the stash; pop it back rather than stranding the user's changes.
@@ -290,10 +351,13 @@ pub fn commit(args: &[String]) -> Result<()> {
             return Err(err);
         }
 
-        if switching_branches && let Err(err) = checkout_branch(&target_branch) {
-            return Err(err.context(
-                "Failed to checkout target branch. Use 'kin abort' to restore original state.",
-            ));
+        if switching_branches {
+            // The index still holds what we are about to commit, and `git
+            // checkout` refuses to carry it whenever one of those paths merely
+            // differs on the target branch. Set the staged content aside too, so
+            // the switch happens on a clean tree, and merge it back on the other
+            // side — a three-way apply, which only fails on a real conflict.
+            carry_staged_changes_onto(&repo, &mut state, &target_branch)?;
         }
 
         // Run the actual git commit
@@ -308,6 +372,103 @@ pub fn commit(args: &[String]) -> Result<()> {
                 ));
             }
             return Err(anyhow!("git commit failed"));
+        }
+
+        if let Some(ancestor_target) = &ancestor_on_target {
+            let moved_commit_id = head_commit_id()?;
+
+            // Take the stash only *after* the commit, for the same reason the
+            // autosquash below does: the staged content is now committed, so a
+            // `--keep-index` stash captures genuinely unstaged leftovers instead
+            // of re-capturing what we just committed. If stashing fails, undo the
+            // commit so the failure can't strand it outside a recoverable state.
+            state.stash_ref = match stash_non_staged_changes() {
+                Ok(stash_ref) => stash_ref,
+                Err(err) => {
+                    match Command::new("git")
+                        .args(["reset", "--soft", "HEAD^"])
+                        .status()
+                    {
+                        Ok(status) if status.success() => return Err(err),
+                        _ => {
+                            return Err(err.context(
+                                "Additionally, failed to roll back the commit; it remains at HEAD. Remove it with 'git reset --soft HEAD^'.",
+                            ));
+                        }
+                    }
+                }
+            };
+
+            // The replay rewrites `<target>..HEAD` with `--update-refs`, which
+            // moves the target's own ref and every branch tip in between. None of
+            // those are in `sub_stack` (the current branch and its descendants),
+            // so record their pre-move tips here or `kin abort` would leave them
+            // on rewritten history.
+            state
+                .original_tip_map
+                .entry(ancestor_target.clone())
+                .or_insert_with(|| requested_target_old_head_id.to_string());
+            record_branch_tips_in_range(
+                &repo,
+                Some(requested_target_old_head_id),
+                moved_commit_id,
+                &mut state.original_tip_map,
+            )?;
+            if let Err(err) = save_state(&repo, &state) {
+                restore_stashed_changes(state.stash_ref.take());
+                return Err(err.context(
+                    "The commit was created on this branch but the move could not be started; it is still at HEAD.",
+                ));
+            }
+
+            println!("Moving the new commit onto '{}'...", ancestor_target);
+            let mut cmd = Command::new("git");
+            cmd.env(
+                "GIT_SEQUENCE_EDITOR",
+                crate::rebase_todo::sequence_editor_command(
+                    &moved_commit_id.to_string(),
+                    &format!("refs/heads/{}", ancestor_target),
+                )?,
+            )
+            .arg("rebase")
+            .arg("-i")
+            // The replay must move exactly the one commit and change nothing
+            // else, so neutralize the ambient config that would otherwise edit
+            // the todo underneath us: `rebase.autosquash` would fold any
+            // `fixup!`/`squash!` commit already in the range, and
+            // `rebase.rebaseMerges` would rewrite the todo into labels and
+            // merges.
+            .arg("--no-autosquash")
+            .arg("--no-rebase-merges")
+            .arg("--update-refs");
+            if autostash {
+                cmd.arg("--autostash");
+            }
+            cmd.arg(ancestor_target);
+
+            if !cmd.status()?.success() {
+                if git_rebase_in_progress(&repo) {
+                    // Record which branch is mid-rebase so `kin continue` matches
+                    // the saved state, exactly as the autosquash path does.
+                    state.in_progress_branch = Some(current_branch_name.clone());
+                    save_state(&repo, &state)?;
+                    return Err(anyhow!(
+                        "Moving the commit onto '{}' hit conflicts. Resolve them and run 'kin continue', or run 'kin abort' to undo the commit and get the changes back staged.",
+                        ancestor_target
+                    ));
+                }
+                return Err(anyhow!(
+                    "Failed to move the commit onto '{}'. The commit is still on '{}'; run 'kin abort' to undo it and get the changes back staged.",
+                    ancestor_target,
+                    current_branch_name
+                ));
+            }
+
+            if move_state_required {
+                restore_autostash(&repo, &mut state)?;
+                clear_state(&repo)?;
+                return Ok(());
+            }
         }
 
         if needs_autosquash {
@@ -574,6 +735,7 @@ fn commit_on_new_branch(
         owned_tip_map: HashMap::new(),
         stash_ref: None,
         stash_apply_index: false,
+        carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
         unstage_on_restore: false,
@@ -1007,6 +1169,96 @@ fn select_target_branch(
         .ok_or_else(|| anyhow!("Failed to resolve selected branch '{}'.", selected_display))
 }
 
+/// Whether `kin commit --on <branch>` can land the commit on `requested_target`
+/// without checking it out, and if so which branch to claim in the rebase todo.
+///
+/// `git checkout` refuses to carry staged changes onto a branch whenever a staged
+/// path merely *differs* there — the common case when the target touched the same
+/// file — so when the target is an ancestor of HEAD the commit is made here and
+/// replayed down onto it instead. The rewritten range is `<target>..HEAD`, which
+/// bounds when that is safe:
+///
+/// - The target must be a branch of this stack, strictly below HEAD, and never
+///   the upstream: trunk is not ours to rewrite.
+/// - The content must come from the index. With `-a`/`-p`/a pathspec, `git
+///   commit` reads the working tree, which on this path has not been set aside
+///   yet, so it would commit more than the checkout path does.
+/// - `--amend` on another branch means "amend that branch's tip", which is a
+///   fold into an existing commit, not a commit that can be moved.
+/// - Every branch descending from the target must be either inside the rewritten
+///   range (moved by `--update-refs`) or a descendant of HEAD (restacked by the
+///   rebase loop afterwards). A branch that forks inside the range but tips
+///   outside it is moved by neither, and a sibling parked on HEAD's commit would
+///   be claimed by the replay it is not part of. The check runs against the
+///   *target's* sub-stack, not the current branch's: a branch hanging off the
+///   middle of the range is exactly the case the current branch's stack context
+///   cannot see.
+///
+/// Anything else falls back to the checkout path, which carries the staged
+/// content across the switch with a stash instead.
+#[allow(clippy::too_many_arguments)]
+fn ancestor_move_target(
+    repo: &Repository,
+    parsed: &ParsedCommitArgs,
+    has_interactive_selection: bool,
+    requested_target: &str,
+    requested_target_old_head_id: Oid,
+    current_branch_name: &str,
+    head_id: Oid,
+    upstream_name: &str,
+    upstream_id: Oid,
+    stack_branches: &[StackBranch],
+) -> Result<Option<String>> {
+    if has_interactive_selection
+        || parsed.on_target.is_none()
+        || requested_target == current_branch_name
+        || requested_target == upstream_name
+    {
+        return Ok(None);
+    }
+
+    if !stack_branches.iter().any(|b| b.name == requested_target)
+        || !repo.graph_descendant_of(head_id, requested_target_old_head_id)?
+    {
+        return Ok(None);
+    }
+
+    if !requires_staged_changes(&parsed.git_commit_args)
+        || !has_staged_changes(repo)?
+        || parsed.git_commit_args.iter().any(|arg| arg == "--amend")
+    {
+        return Ok(None);
+    }
+
+    let target_stack = build_stack_context(
+        repo,
+        requested_target_old_head_id,
+        upstream_id,
+        upstream_name,
+    )?;
+    let descendants = collect_target_sub_stack(
+        repo,
+        requested_target,
+        requested_target_old_head_id,
+        upstream_name,
+        &target_stack.stack_branches,
+    )?;
+    for branch in &descendants {
+        if branch.name == requested_target || branch.name == current_branch_name {
+            continue;
+        }
+        let in_rewritten_range = branch.id != head_id
+            && repo.graph_descendant_of(head_id, branch.id)?
+            && repo.graph_descendant_of(branch.id, requested_target_old_head_id)?;
+        let restacked_afterwards = repo.graph_descendant_of(branch.id, head_id)?;
+        if !in_rewritten_range && !restacked_afterwards {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(requested_target.to_string()))
+}
+
 fn collect_target_sub_stack(
     repo: &Repository,
     target_branch: &str,
@@ -1187,6 +1439,137 @@ fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
     state.stash_ref = None;
     state.in_progress_branch = None;
     save_state(repo, state)
+}
+
+/// The commit id at HEAD, read through git so it reflects a commit just made by
+/// a subprocess rather than whatever the open repository handle has cached.
+fn head_commit_id() -> Result<Oid> {
+    let output = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to resolve HEAD after committing: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(Oid::from_str(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    )?)
+}
+
+/// Switch to `target_branch` with the staged content in hand.
+///
+/// The unstaged changes are already set aside at this point, so the tree holds
+/// exactly what the commit will take. `git checkout` still refuses to carry that
+/// across whenever one of those paths differs on the target branch — it declines
+/// on any difference, not just a conflicting one — so the staged content rides
+/// along in a stash of its own instead: switch on a clean tree, then bring it
+/// back with `git stash apply --index`, a three-way merge that only fails when
+/// the change genuinely conflicts with the target.
+///
+/// The carry stash is recorded in the saved state while it is live, and every
+/// path out of here clears it again: on success by dropping it, on failure by
+/// putting it back where it applies cleanly (the branch it was taken on).
+fn carry_staged_changes_onto(
+    repo: &Repository,
+    state: &mut RebaseState,
+    target_branch: &str,
+) -> Result<()> {
+    let caller_branch = state.caller_branch.clone().ok_or_else(|| {
+        anyhow!("Internal error: no caller branch recorded for the branch switch.")
+    })?;
+
+    let carry_stash = stash_push_changes(false, "kin-commit-on-index").with_context(|| {
+        "Failed to set the staged changes aside for the branch switch. Use 'kin abort' to restore original state."
+    })?;
+    let Some(carry_stash) = carry_stash else {
+        // Nothing staged to carry (an empty or `-a`-style commit): the tree is
+        // already clean, so the switch cannot be refused for our changes.
+        return checkout_branch(target_branch).context(
+            "Failed to checkout target branch. Use 'kin abort' to restore original state.",
+        );
+    };
+
+    state.carry_stash_ref = Some(carry_stash.clone());
+    if let Err(err) = save_state(repo, state) {
+        restore_set_aside_changes(state.carry_stash_ref.take());
+        return Err(err);
+    }
+
+    if let Err(err) = checkout_branch(target_branch) {
+        // Nothing moved, so put the staged content back on the branch it was
+        // taken from and leave the rest of the state for `kin abort`.
+        restore_set_aside_changes(state.carry_stash_ref.take());
+        save_state(repo, state)?;
+        return Err(err.context(
+            "Failed to checkout target branch. Use 'kin abort' to restore original state.",
+        ));
+    }
+
+    match apply_stash_with_outcome(&carry_stash, true) {
+        Ok(StashApplyOutcome::Applied) => {
+            state.carry_stash_ref = None;
+            save_state(repo, state)?;
+            if let Err(err) = drop_stash(&carry_stash) {
+                eprintln!("Warning: {}", err);
+            }
+            Ok(())
+        }
+        Ok(StashApplyOutcome::ConflictsLeftInTree) => {
+            // A real conflict between the staged change and the target branch —
+            // the one case a switch genuinely cannot carry. The stash entry still
+            // holds the change, so discard the conflicted merge and unwind the
+            // whole operation: the user is left where they started, on their own
+            // branch with their changes as they were, rather than mid-merge on a
+            // branch they didn't ask to be on.
+            state.carry_stash_ref = None;
+            let unwound = unwind_carry_to_caller(&carry_stash, &caller_branch)
+                .and_then(|()| {
+                    restore_stashed_changes(state.stash_ref.take());
+                    clear_state(repo)
+                });
+            let err = anyhow!(
+                "The staged changes conflict with '{}', so committing them there would leave conflicts to resolve. Restack this branch onto '{}' first, or move the overlapping changes by hand.",
+                target_branch,
+                target_branch
+            );
+            match unwound {
+                Ok(()) => Err(err),
+                Err(unwind_err) => {
+                    save_state(repo, state)?;
+                    Err(err.context(format!(
+                        "Additionally, restoring the changes on '{caller_branch}' did not complete ({unwind_err}); they are preserved in stash entries listed by 'git stash list'."
+                    )))
+                }
+            }
+        }
+        Err(err) => Err(err.context(
+            "Failed to move the staged changes onto the target branch. Use 'kin abort' to restore original state.",
+        )),
+    }
+}
+
+/// Undo a conflicted carry: drop the conflicted merge from the tree, return to
+/// `caller_branch`, and re-apply `carry_stash` there — its base, so it applies
+/// cleanly. The entry is dropped only once it is back in the tree.
+fn unwind_carry_to_caller(carry_stash: &str, caller_branch: &str) -> Result<()> {
+    let status = Command::new("git").args(["reset", "--hard"]).status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Failed to discard the conflicted changes from the working tree."
+        ));
+    }
+    checkout_branch(caller_branch)?;
+    match apply_stash_with_outcome(carry_stash, true)? {
+        StashApplyOutcome::Applied => {
+            if let Err(err) = drop_stash(carry_stash) {
+                eprintln!("Warning: {}", err);
+            }
+            Ok(())
+        }
+        StashApplyOutcome::ConflictsLeftInTree => {
+            Err(anyhow!("restoring them left conflicts in the working tree"))
+        }
+    }
 }
 
 fn stash_non_staged_changes() -> Result<Option<String>> {

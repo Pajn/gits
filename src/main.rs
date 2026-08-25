@@ -3,6 +3,7 @@ mod editor;
 mod gh;
 mod interaction;
 mod oplog;
+mod rebase_todo;
 mod rebase_utils;
 mod repository;
 mod runtime;
@@ -162,6 +163,21 @@ enum Commands {
     },
     /// Print shell integration (e.g. the `kin wt cd` wrapper) to eval in your shell config
     ShellInit(ShellInitArgs),
+    /// Internal: rewrite the rebase todo list git passes to its sequence editor.
+    ///
+    /// Kindra hands itself to git as `GIT_SEQUENCE_EDITOR` when it moves a commit
+    /// onto an ancestor branch; this is that hook, not a command to run by hand.
+    #[command(hide = true)]
+    RebaseTodo {
+        /// Commit whose `pick` moves to the front of the todo list
+        #[arg(long)]
+        commit: String,
+        /// Ref to move onto the relocated commit
+        #[arg(long = "claim-ref")]
+        claim_ref: String,
+        /// Todo list to rewrite, appended by git
+        todo: std::path::PathBuf,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -301,6 +317,11 @@ fn dispatch() -> Result<()> {
             ),
         },
         Commands::ShellInit(args) => shell_init(args)?,
+        Commands::RebaseTodo {
+            commit,
+            claim_ref,
+            todo,
+        } => rebase_todo::rewrite_todo_file(todo, commit, claim_ref)?,
     }
 
     Ok(())
