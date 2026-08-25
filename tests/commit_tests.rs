@@ -2257,8 +2257,27 @@ fn test_commit_on_ancestor_conflict_can_be_finished_with_continue() {
         );
         run_ok("git", &["add", "f.txt"], repo_path);
         // Only the last continue finishes; the earlier ones stop on the next
-        // conflict, which the loop resolves in turn.
-        let _ = kin_cmd().current_dir(repo_path).arg("continue").output();
+        // conflict, which the loop resolves in turn. Which of the two happened
+        // has to match the exit status, or a `kin continue` that failed for some
+        // other reason would pass for progress.
+        let out = kin_cmd()
+            .current_dir(repo_path)
+            .arg("continue")
+            .output()
+            .unwrap();
+        if repo_path.join(".git/rebase-merge").exists() {
+            assert!(
+                !out.status.success(),
+                "a stop on the next conflict must be reported as a failure\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            assert!(
+                out.status.success(),
+                "the continue that finishes the move must succeed\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
     assert!(stops >= 2, "expected a stop per conflicting commit");
 
