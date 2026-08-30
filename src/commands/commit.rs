@@ -7,7 +7,8 @@ use crate::rebase_utils::{
 };
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
-    enumerate_stack_commits, get_stack_branches_from_merge_base, sort_branches_topologically,
+    enumerate_fixup_commits, enumerate_stack_commits, get_stack_branches_from_merge_base,
+    sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
@@ -71,8 +72,13 @@ pub fn commit(args: &[String]) -> Result<()> {
             enumerate_stack_commits(&repo, &current_stack.stack_branches, &upstream_name)?;
         Some(select_commit_interactive(&commits)?)
     } else if let Some(fixup_target) = &parsed.fixup_target {
-        let commits =
-            enumerate_stack_commits(&repo, &current_stack.stack_branches, &upstream_name)?;
+        let commits = enumerate_fixup_commits(
+            &repo,
+            &current_stack.stack_branches,
+            &upstream_name,
+            &current_branch_name,
+            head_id,
+        )?;
         Some(resolve_fixup_commit(&repo, &commits, fixup_target)?)
     } else {
         None
