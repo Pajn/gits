@@ -1762,18 +1762,77 @@ pub fn enumerate_stack_commits(
     Ok(commits)
 }
 
-/// Enumerate the commits in the current stack — the base branch through every
-/// branch tip reachable from HEAD, which is exactly the set a `--fixup` target
-/// must belong to. Centralizes the upstream / merge-base / stack-branch discovery
-/// so callers (e.g. the `--fixup` completer) don't re-assemble the stack context.
-pub fn enumerate_current_stack_commits(repo: &Repository) -> Result<Vec<StackCommit>> {
+/// Enumerate commits accepted by `kin commit --fixup` for the current branch.
+///
+/// Feature branches are limited to the current stack. When HEAD is the base
+/// branch itself, its first-parent history is eligible too: those commits are
+/// excluded from the private stack range by definition, but are precisely the
+/// commits a user on the base branch needs to be able to amend or autosquash.
+pub fn enumerate_fixup_commits(
+    repo: &Repository,
+    stack_branches: &[StackBranch],
+    upstream_name: &str,
+    current_branch_name: &str,
+    head_id: Oid,
+) -> Result<Vec<StackCommit>> {
+    let mut commits = enumerate_stack_commits(repo, stack_branches, upstream_name)?;
+    if current_branch_name != upstream_name {
+        return Ok(commits);
+    }
+
+    let mut ids = Vec::new();
+    let mut commit = repo.find_commit(head_id)?;
+    loop {
+        ids.push(commit.id());
+        if commit.parent_count() == 0 {
+            break;
+        }
+        commit = commit.parent(0)?;
+    }
+
+    let total = ids.len();
+    let mut seen: HashSet<Oid> = commits.iter().map(|commit| commit.commit_id).collect();
+    let mut base_commits = Vec::with_capacity(total);
+    for (index, id) in ids.into_iter().enumerate() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let commit = repo.find_commit(id)?;
+        base_commits.push(StackCommit {
+            commit_id: id,
+            branch_name: upstream_name.to_string(),
+            position: (total - index, total),
+            message: commit.summary().unwrap_or("").to_string(),
+        });
+    }
+    base_commits.append(&mut commits);
+    Ok(base_commits)
+}
+
+/// Discover and enumerate the commits accepted by `kin commit --fixup` from the
+/// currently checked-out branch. Centralizes the branch / upstream / stack
+/// discovery for callers such as the dynamic completion provider.
+pub fn enumerate_current_fixup_commits(repo: &Repository) -> Result<Vec<StackCommit>> {
+    if repo.head_detached()? {
+        return Ok(Vec::new());
+    }
     let Some(upstream_name) = crate::commands::find_upstream(repo)? else {
         return Ok(Vec::new());
     };
     let upstream_id = repo.revparse_single(&upstream_name)?.id();
-    let head_id = repo.head()?.peel_to_commit()?.id();
+    let head = repo.head()?;
+    let head_id = head.peel_to_commit()?.id();
+    let Some(current_branch_name) = head.shorthand() else {
+        return Ok(Vec::new());
+    };
     let stack_branches = get_stack_branches_for_head(repo, head_id, upstream_id, &upstream_name)?;
-    enumerate_stack_commits(repo, &stack_branches, &upstream_name)
+    enumerate_fixup_commits(
+        repo,
+        &stack_branches,
+        &upstream_name,
+        current_branch_name,
+        head_id,
+    )
 }
 
 /// Discover the stack for `head_id` relative to `upstream_id`, computing the

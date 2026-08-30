@@ -87,10 +87,10 @@ pub fn fixup_commit_completer() -> ArgValueCompleter {
     ArgValueCompleter::new(fixup_commit_candidates)
 }
 
-/// Suggest the commits in the current stack for `kin commit --fixup <sha>` — the
-/// same set `resolve_fixup_commit` accepts as targets — offering the abbreviated
-/// SHA as the value and the commit subject as help. Stack discovery is delegated
-/// to [`crate::stack::enumerate_current_stack_commits`]. Best-effort: any failure
+/// Suggest the commits accepted by `kin commit --fixup <sha>` — the current
+/// stack, plus base-branch history when run from that branch — offering the
+/// abbreviated SHA as the value and the commit subject as help. Discovery is delegated
+/// to [`crate::stack::enumerate_current_fixup_commits`]. Best-effort: any failure
 /// to resolve the stack yields no suggestions rather than an error.
 fn fixup_commit_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
@@ -99,7 +99,7 @@ fn fixup_commit_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     let Ok(repo) = Repository::discover(".") else {
         return Vec::new();
     };
-    let Ok(commits) = crate::stack::enumerate_current_stack_commits(&repo) else {
+    let Ok(commits) = crate::stack::enumerate_current_fixup_commits(&repo) else {
         return Vec::new();
     };
     commits

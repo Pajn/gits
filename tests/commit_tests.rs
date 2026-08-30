@@ -4303,6 +4303,65 @@ fn test_commit_fixup_tip_amends() {
 }
 
 #[test]
+fn test_commit_fixup_older_main_commit_restacks_descendants() {
+    let (dir, repo) = setup_repo();
+    let root_id = repo.revparse_single("main").unwrap().id();
+    let root_commit = repo.find_commit(root_id).unwrap();
+
+    let main_tip_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "main",
+        "second main commit",
+        &[&root_commit],
+    );
+    let main_tip = repo.find_commit(main_tip_id).unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "feature-a.txt",
+        "feature-a",
+        "feature commit",
+        &[&main_tip],
+    );
+
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("file.txt"), "fixed root").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(root_id.to_string())
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let new_main_id = repo.revparse_single("main").unwrap().id();
+    assert_ne!(new_main_id, main_tip_id);
+    let new_main = repo.find_commit(new_main_id).unwrap();
+    assert_eq!(new_main.summary().unwrap(), "second main commit");
+    let new_root_id = new_main.parent_id(0).unwrap();
+    assert_ne!(new_root_id, root_id);
+    assert_eq!(blob_text(&repo, new_root_id, "file.txt"), "fixed root");
+
+    let new_feature_id = repo.revparse_single("feature-a").unwrap().id();
+    assert_ne!(new_feature_id, feature_id);
+    assert_eq!(
+        repo.find_commit(new_feature_id)
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        new_main_id,
+        "the feature branch should be restacked onto rewritten main"
+    );
+}
+
+#[test]
 fn test_commit_fixup_sha_outside_stack_errors() {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();

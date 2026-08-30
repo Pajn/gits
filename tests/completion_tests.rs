@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, setup_repo};
+use common::{kin_cmd, setup_repo, setup_worktree_repo};
 use predicates::prelude::*;
 
 #[test]
@@ -63,6 +63,58 @@ fn commit_fixup_completes_stack_commit_shas() {
         .assert()
         .success()
         .stdout(predicate::str::contains(head_short));
+}
+
+#[test]
+fn commit_fixup_completes_main_commit_shas_on_main() {
+    let dir = setup_worktree_repo();
+    let main_short: String = git2::Repository::open(dir.path())
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect();
+
+    let mut cmd = kin_cmd();
+    cmd.env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "3")
+        .arg("--")
+        .arg("kin")
+        .arg("commit")
+        .arg("--fixup")
+        .arg("")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(main_short));
+}
+
+#[test]
+fn commit_fixup_completion_is_empty_at_detached_head() {
+    let dir = setup_repo();
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.set_head_detached(head_id).unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "3")
+        .arg("--")
+        .arg("kin")
+        .arg("commit")
+        .arg("--fixup")
+        .arg("")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
