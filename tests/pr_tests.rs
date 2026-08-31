@@ -382,6 +382,148 @@ exit 1
 }
 
 #[test]
+fn single_commit_enter_uses_commit_body_without_template() {
+    let dir = setup_pushed_feature();
+    run_ok(
+        "git",
+        &[
+            "commit",
+            "--amend",
+            "-m",
+            "feat: add feature\n\nThe commit body is the PR body.",
+        ],
+        dir.path(),
+    );
+
+    let template = "## Summary\n\n## Test Plan\n";
+    fs::create_dir_all(dir.path().join(".github")).unwrap();
+    fs::write(
+        dir.path().join(".github/pull_request_template.md"),
+        template,
+    )
+    .unwrap();
+    run_ok(
+        "git",
+        &["push", "--force", "-u", "origin", "feature"],
+        dir.path(),
+    );
+
+    let body_file = dir.path().join("captured_body.txt");
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("KIN_TEST_PR_BODY_ACTION", "enter")
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sent = fs::read_to_string(&body_file).unwrap();
+    assert_eq!(sent, "The commit body is the PR body.");
+    assert!(!sent.contains(template));
+}
+
+#[test]
+fn multiple_commit_editor_prefill_contains_full_commit_messages() {
+    let dir = setup_pushed_feature();
+    run_ok(
+        "git",
+        &[
+            "commit",
+            "--amend",
+            "-m",
+            "feat: add --> feature\n\nFirst commit body before --> and after.",
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "feat: extend feature\n\nSecond commit body.",
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "--force", "-u", "origin", "feature"],
+        dir.path(),
+    );
+
+    let editor_capture = dir.path().join("editor-prefill.txt");
+    let editor = write_script(
+        &dir.path().join("capture-editor.sh"),
+        "#!/bin/sh\ncat \"$1\" > \"$EDITOR_CAPTURE\"\n",
+    );
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+    let body_file = dir.path().join("captured_body.txt");
+
+    let output = kin_cmd()
+        .args(["pr", "--title", "Multi-commit feature"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GIT_EDITOR", &editor)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        .env("EDITOR_CAPTURE", &editor_capture)
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let prefill = fs::read_to_string(&editor_capture).unwrap();
+    let (commit_reference, _) = prefill
+        .split_once("-->")
+        .expect("editor prefill should contain a closing HTML comment");
+    assert!(commit_reference.contains("feat: add --&gt; feature"));
+    assert!(commit_reference.contains("First commit body before --&gt; and after."));
+    assert!(commit_reference.contains("feat: extend feature"));
+    assert!(commit_reference.contains("Second commit body."));
+    assert_eq!(
+        prefill.matches("-->").count(),
+        1,
+        "commit bodies must not terminate the reference comment early"
+    );
+    assert_eq!(
+        fs::read_to_string(&body_file).unwrap(),
+        "",
+        "the complete commit reference comment should be stripped from the PR body"
+    );
+}
+
+#[test]
 fn test_pr_label_flag() {
     let (dir, _repo) = setup_simple_stack();
 
@@ -985,6 +1127,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let captured_body_path = dir.path().join("captured_body.txt");
+    let editor = write_script(&dir.path().join("noop-editor.sh"), "#!/bin/sh\nexit 0\n");
 
     let output = kin_cmd()
         .arg("pr")
@@ -997,6 +1140,8 @@ exit 1
                 std::env::var("PATH").unwrap()
             ),
         )
+        .env("GIT_EDITOR", &editor)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
         .env("MOCK_GH_BODY_FILE", &captured_body_path)
         .output()
         .unwrap();
@@ -1004,7 +1149,7 @@ exit 1
     assert!(output.status.success(), "kin pr failed: {:?}", output);
     let captured_body = fs::read_to_string(&captured_body_path).unwrap();
     assert!(
-        captured_body.contains(template_content),
+        captured_body.contains(template_content.trim()),
         "PR body should include template content. Got:\n{}",
         captured_body
     );

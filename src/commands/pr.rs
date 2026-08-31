@@ -1618,25 +1618,47 @@ fn build_body_from_commits(commits: &[CommitSummary]) -> String {
     body.trim_end().to_string()
 }
 
+fn escape_html_comment_terminators(text: &str) -> String {
+    text.replace("-->", "--&gt;")
+}
+
 fn prompt_body(
     branch_name: &str,
     commits: &[CommitSummary],
     draft: &crate::editor::Draft,
 ) -> Result<String> {
-    // Build commit list HTML comment preamble
+    // Build a readable HTML-comment reference containing each full commit
+    // message. It is stripped before submission, but gives the author useful
+    // context when opening the editor.
     let mut preamble = format!("<!--\nCommits on {}:\n", branch_name);
     for c in commits {
-        preamble.push_str(&format!("- {}\n", c.subject));
+        preamble.push_str(&format!(
+            "- {}\n",
+            escape_html_comment_terminators(&c.subject)
+        ));
+        let body = c.body.trim();
+        if !body.is_empty() {
+            preamble.push('\n');
+            preamble.push_str(&escape_html_comment_terminators(body));
+            preamble.push('\n');
+        }
+        preamble.push('\n');
     }
     preamble.push_str("-->\n");
 
     // Try to read PR template
     let template = read_pr_template().unwrap_or_default();
 
-    let editor_prefill = if commits.len() == 1 && !commits[0].body.is_empty() {
-        format!("{}\n\n{}\n\n{}", commits[0].body, preamble, template)
-    } else {
-        format!("{}\n\n{}", preamble, template)
+    let editor_prefill = format!("{}\n{}", preamble, template);
+
+    // A single commit has an unambiguous body, so Enter accepts it directly.
+    // Multiple commits retain the template-oriented editor flow.
+    let default_body = || {
+        if commits.len() == 1 {
+            Ok(commits[0].body.trim().to_string())
+        } else {
+            open_editor_for_body(&editor_prefill, draft)
+        }
     };
 
     // In a non-interactive session we normally can't prompt, so we fall back to
@@ -1652,7 +1674,13 @@ fn prompt_body(
         // then discarded on the next success). We can't prompt here, so reuse it.
         return match draft.recover() {
             Some(saved) => Ok(strip_html_comment(&saved).trim().to_string()),
-            None => Ok(editor_prefill),
+            None => {
+                if commits.len() == 1 {
+                    Ok(commits[0].body.trim().to_string())
+                } else {
+                    Ok(strip_html_comment(&editor_prefill).trim().to_string())
+                }
+            }
         };
     }
 
@@ -1677,12 +1705,17 @@ fn prompt_body(
     if let Some(action) = test_action {
         return match action.as_str() {
             "editor" | "template" => open_editor_for_body(&editor_prefill, draft),
+            "enter" | "default" => default_body(),
             "blank" => Ok(String::new()),
             other => Err(anyhow!("unknown KIN_TEST_PR_BODY_ACTION: {other}")),
         };
     }
 
-    println!("  PR body: [e] open editor  [b] leave blank  [enter] use PR template");
+    if commits.len() == 1 {
+        println!("  PR body: [e] open editor  [b] leave blank  [enter] use commit body");
+    } else {
+        println!("  PR body: [e] open editor  [b] leave blank  [enter] use PR template");
+    }
 
     loop {
         crossterm::terminal::enable_raw_mode()?;
@@ -1700,8 +1733,7 @@ fn prompt_body(
             }
             Some("\r") | Some("\n") | Some("") => {
                 println!();
-                // Use template (open editor prefilled with preamble + template)
-                return open_editor_for_body(&editor_prefill, draft);
+                return default_body();
             }
             _ => {
                 // ignore and re-prompt
