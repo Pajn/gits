@@ -380,6 +380,17 @@ pub fn commit(args: &[String]) -> Result<()> {
             return Err(anyhow!("git commit failed"));
         }
 
+        if !switching_branches && !needs_autosquash && !moving_onto_ancestor {
+            // The commit (including an amend) has succeeded. Abort should undo
+            // only the dependent restack, keeping the user's committed work.
+            // Parent maps still refer to the old tip so descendants replay the
+            // correct range; only the rollback checkpoint advances here.
+            state
+                .original_tip_map
+                .insert(target_branch.clone(), head_commit_id()?.to_string());
+            save_state(&repo, &state)?;
+        }
+
         if let Some(ancestor_target) = &ancestor_on_target {
             let moved_commit_id = head_commit_id()?;
 

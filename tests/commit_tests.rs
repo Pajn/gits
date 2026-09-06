@@ -737,6 +737,15 @@ fn test_commit_conflict_and_continue() {
 
 #[test]
 fn test_commit_abort() {
+    assert_commit_abort_preserves_commit(false);
+}
+
+#[test]
+fn test_commit_amend_abort_preserves_commit() {
+    assert_commit_abort_preserves_commit(true);
+}
+
+fn assert_commit_abort_preserves_commit(amend: bool) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
@@ -753,7 +762,7 @@ fn test_commit_abort() {
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a (will conflict)
-    let _b_id = make_commit(
+    let b_id = make_commit(
         &repo,
         "refs/heads/feature-b",
         "shared.txt",
@@ -782,8 +791,12 @@ fn test_commit_abort() {
     );
 
     let mut cmd = kin_cmd();
-    cmd.arg("commit")
-        .arg("-m")
+    if amend {
+        cmd.arg("commit").arg("--amend");
+    } else {
+        cmd.arg("commit");
+    }
+    cmd.arg("-m")
         .arg("conflict")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
@@ -796,6 +809,9 @@ fn test_commit_abort() {
 
     assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
 
+    let committed_tip = repo.revparse_single("feature-a").unwrap().id();
+    assert_ne!(committed_tip, a_id);
+
     // Abort
     let mut cmd_abort = kin_cmd();
     cmd_abort
@@ -805,6 +821,18 @@ fn test_commit_abort() {
         .success();
 
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-a");
+    assert_eq!(
+        repo.revparse_single("feature-a").unwrap().id(),
+        committed_tip,
+        "aborting the restack must keep the newly created commit"
+    );
+    assert_eq!(repo.revparse_single("feature-b").unwrap().id(), b_id);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "conflict"
+    );
+    assert!(repo.statuses(None).unwrap().is_empty());
 }
 
 #[test]
