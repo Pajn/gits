@@ -5312,3 +5312,171 @@ fn test_commit_new_branch_slug_collision_gets_numeric_suffix() {
         "shared-subject-2"
     );
 }
+
+#[test]
+fn test_abort_clear_state_preserves_conflicted_rebase() {
+    let (dir, repo) = setup_repo();
+    setup_insert_conflict(dir.path(), &repo);
+    let head = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+    let refs = git_stdout(dir.path(), &["show-ref"]);
+    let index = fs::read(repo.path().join("index")).unwrap();
+    let content = fs::read(dir.path().join("shared.txt")).unwrap();
+    let rebase_head = git_stdout(dir.path(), &["rev-parse", "REBASE_HEAD"]);
+
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["abort", "--clear-state"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Git rebase is still in progress"));
+
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(dir.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(git_stdout(dir.path(), &["show-ref"]), refs);
+    assert_eq!(fs::read(repo.path().join("index")).unwrap(), index);
+    assert_eq!(fs::read(dir.path().join("shared.txt")).unwrap(), content);
+    assert_eq!(
+        git_stdout(dir.path(), &["rev-parse", "REBASE_HEAD"]),
+        rebase_head
+    );
+    assert!(repo.path().join("rebase-merge").exists());
+    run_ok("git", &["rebase", "--abort"], dir.path());
+    kin_commit(dir.path())
+        .args(["--allow-empty", "-m", "after clearing state"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_abort_clear_state_preserves_stash_and_dirty_changes() {
+    let (dir, repo) = setup_repo();
+    stage(dir.path(), "saved.txt", "saved work");
+    run_ok("git", &["stash", "push", "-m", "saved work"], dir.path());
+    write_commit_rebase_state_fixture(&repo, "saved work");
+    stage(dir.path(), "file.txt", "staged");
+    fs::write(dir.path().join("file.txt"), "unstaged").unwrap();
+    fs::write(dir.path().join("untracked.txt"), "untracked").unwrap();
+    let refs = git_stdout(dir.path(), &["show-ref"]);
+    let stashes = git_stdout(dir.path(), &["stash", "list"]);
+    let index = fs::read(repo.path().join("index")).unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["abort", "--clear-state"])
+        .assert()
+        .success();
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert_eq!(git_stdout(dir.path(), &["show-ref"]), refs);
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), stashes);
+    assert_eq!(fs::read(repo.path().join("index")).unwrap(), index);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "unstaged"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert!(!dir.path().join("saved.txt").exists());
+}
+
+#[test]
+fn test_abort_clear_state_handles_malformed_overlapping_and_missing_state() {
+    let (dir, repo) = setup_repo();
+    for name in ["kindra_rebase_state.json", "kindra_run_state.json"] {
+        fs::write(repo.path().join(name), "invalid json").unwrap();
+    }
+    for _ in 0..2 {
+        kin_cmd()
+            .current_dir(dir.path())
+            .args(["abort", "--clear-state"])
+            .assert()
+            .success();
+        assert!(!repo.path().join("kindra_rebase_state.json").exists());
+        assert!(!repo.path().join("kindra_run_state.json").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_commit_checkpoint_write_failure_restores_tip() {
+    assert_checkpoint_write_failure_restores_tip(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_amend_checkpoint_write_failure_restores_tip() {
+    assert_checkpoint_write_failure_restores_tip(true);
+}
+
+#[cfg(unix)]
+fn assert_checkpoint_write_failure_restores_tip(amend: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, repo) = setup_repo();
+    let git_dir = repo.path();
+    let failure_marker = git_dir.join("checkpoint-write-failure");
+    let original = repo.revparse_single("main").unwrap().id();
+    let child = repo.revparse_single("feature").unwrap().id();
+    stage(dir.path(), "new.txt", "committed content\n");
+    fs::write(dir.path().join("file.txt"), "unstaged content\n").unwrap();
+    let hook = git_dir.join("hooks/post-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s' \"$(git rev-parse --absolute-git-dir)/kindra_rebase_state.json\" > \"$KIN_TEST_FAIL_STATE_WRITE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = kin_commit(dir.path());
+    cmd.args(["-m", "checkpoint failure"])
+        .env("KIN_TEST_FAIL_STATE_WRITE", &failure_marker);
+    if amend {
+        cmd.arg("--amend");
+    }
+    let output = cmd.output().unwrap();
+    fs::remove_file(hook).unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        failure_marker.exists(),
+        "post-commit hook must activate the failure"
+    );
+    assert!(stderr.contains("Injected state write failure"), "{stderr}");
+    assert_eq!(
+        repo.revparse_single("main").unwrap().id(),
+        original,
+        "checkpoint write failure must restore the exact pre-commit tip: {stderr}"
+    );
+    let replacement = git_stdout(dir.path(), &["rev-parse", "main@{1}"]);
+    assert!(
+        stderr.contains(&format!("git show {}", replacement.trim())),
+        "{stderr}"
+    );
+    assert_eq!(repo.revparse_single("feature").unwrap().id(), child);
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_no_rebase_in_progress(dir.path());
+    assert_eq!(
+        git_stdout(dir.path(), &["show", ":new.txt"]),
+        "committed content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "unstaged content\n"
+    );
+    // The failed write must leave the original checkpoint parseable. Once the
+    // failure marker is removed, clearing it permits retrying the commit.
+    fs::remove_file(&failure_marker).unwrap();
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
+    assert_eq!(state.original_tip_map["main"], original.to_string());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["abort", "--clear-state"])
+        .assert()
+        .success();
+    let mut retry = kin_commit(dir.path());
+    retry
+        .args(["-m", "retry", "--autostash"])
+        .env("KIN_TEST_FAIL_STATE_WRITE", &failure_marker);
+    if amend {
+        retry.arg("--amend");
+    }
+    retry.assert().success();
+}

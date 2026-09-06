@@ -129,7 +129,11 @@ enum Commands {
     /// Continue an in-progress Kindra operation
     Continue,
     /// Abort an in-progress Kindra operation
-    Abort,
+    Abort {
+        /// Clear only Kindra's saved operation state; keep Git state and stashes intact
+        #[arg(long)]
+        clear_state: bool,
+    },
     /// Show the status of an in-progress Kindra operation
     Status,
     /// Undo the most recent stack-rewriting operation (sync, reorder, move, restack, split)
@@ -296,7 +300,7 @@ fn dispatch() -> Result<()> {
         Commands::Absorb(args) => absorb(args)?,
         Commands::Commit { args } => commit(args)?,
         Commands::Continue => continue_cmd()?,
-        Commands::Abort => abort_cmd()?,
+        Commands::Abort { clear_state } => abort_cmd(*clear_state)?,
         Commands::Status => status_cmd()?,
         Commands::Undo { force } => oplog::undo(*force)?,
         Commands::Redo { force } => oplog::redo(*force)?,

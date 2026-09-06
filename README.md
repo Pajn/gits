@@ -284,3 +284,15 @@ cargo bench --bench checkout_top
 ## Why Kindra?
 
 Traditional git workflows often involve large, monolithic Pull Requests or manual, error-prone rebasing when trying to keep multiple small, dependent PRs in sync. Kindra treats your branches as a **stack**, allowing you to focus on small, reviewable increments of code while it handles the plumbing.
+
+### Clearing an interrupted operation
+
+Use `kin abort --clear-state` to forget Kindra's saved operation and manage the
+current Git state yourself. It clears both rebase and `kin run` state, including
+malformed state files, without restoring branch tips, switching branches,
+changing the index or working tree, or applying or dropping saved stashes.
+
+An active Git rebase stays active: finish or abort it with Git. Other `kin`
+commands are no longer blocked by the saved Kindra operation, but Git's normal
+requirements for a clean working tree or completed rebase still apply. Saved
+changes remain available through `git stash list`.
