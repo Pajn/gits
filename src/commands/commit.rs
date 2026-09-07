@@ -380,6 +380,37 @@ pub fn commit(args: &[String]) -> Result<()> {
             return Err(anyhow!("git commit failed"));
         }
 
+        if !switching_branches && !needs_autosquash && !moving_onto_ancestor {
+            // The commit (including an amend) has succeeded. Abort should undo
+            // only the dependent restack, keeping the user's committed work.
+            // Parent maps still refer to the old tip so descendants replay the
+            // correct range; only the rollback checkpoint advances here.
+            let committed_tip = head_commit_id()?;
+            state
+                .original_tip_map
+                .insert(target_branch.clone(), committed_tip.to_string());
+            if let Err(err) = save_state(&repo, &state) {
+                // Move only the ref, retaining the committed index and unstaged
+                // work. Unlike HEAD^, the captured tip also restores an amend.
+                // Compare the current tip before replacing it, so unexpected
+                // concurrent ref changes are not overwritten.
+                return match repo.reference_matching(
+                    &format!("refs/heads/{target_branch}"),
+                    target_old_head_id,
+                    true,
+                    committed_tip,
+                    "kin commit: restore tip after checkpoint failure",
+                ) {
+                    Ok(_) => Err(err.context(format!(
+                        "Failed to save the post-commit checkpoint. Restored the pre-commit tip; any committed file changes remain staged. Inspect 'git show {committed_tip}' to recover the commit message or metadata, including a metadata-only amend. Fix the state persistence problem, then run 'kin abort --clear-state' before retrying."
+                    ))),
+                    Err(rollback_err) => Err(err.context(format!(
+                        "Failed to save the post-commit checkpoint and restore '{target_branch}': {rollback_err}. Your commit is {committed_tip}; dependent branches have not been restacked."
+                    ))),
+                };
+            }
+        }
+
         if let Some(ancestor_target) = &ancestor_on_target {
             let moved_commit_id = head_commit_id()?;
 

@@ -7,7 +7,7 @@ use git2::Oid;
 use std::collections::HashMap;
 use std::process::Command;
 
-pub fn abort_cmd() -> Result<()> {
+pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
     let path = state_path(&repo);
@@ -25,6 +25,29 @@ pub fn abort_cmd() -> Result<()> {
         repo: &repo,
         action: SettleAction::Leave,
     };
+
+    if clear_state_only {
+        // This escape hatch deliberately does not deserialize state: it must
+        // also work for malformed files or overlapping interrupted operations.
+        // Keep Git's rebase, refs, index, worktree and stash entries untouched.
+        for state_file in [&path, &crate::commands::run::run_state_path(&repo)] {
+            match std::fs::remove_file(state_file) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if !git_rebase_in_progress(&repo) {
+            settle.action = SettleAction::Finalize;
+        }
+        println!("Kindra operation state cleared. Git state and saved stashes were left intact.");
+        if git_rebase_in_progress(&repo) {
+            println!(
+                "The Git rebase is still in progress; manage it with git rebase --continue or --abort."
+            );
+        }
+        return Ok(());
+    }
 
     if has_rebase_state && has_run_state {
         return Err(anyhow!(

@@ -37,6 +37,20 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         })?;
     }
 
+    // Integration-test fault injection: the environment variable names a marker
+    // whose contents select the exact destination to fail. A post-commit hook
+    // creates it only after the initial checkpoint, so recovery tests exercise
+    // the later write without relying on permissions (which root bypasses).
+    if let Some(marker) = std::env::var_os("KIN_TEST_FAIL_STATE_WRITE")
+        && let Ok(destination) = fs::read_to_string(marker)
+        && Path::new(&destination) == path
+    {
+        return Err(anyhow!(
+            "Injected state write failure for '{}'",
+            path.display()
+        ));
+    }
+
     let temp_path = temp_path_for(path);
     // Clear any leftover temp file from a previous crashed write.
     match fs::remove_file(&temp_path) {
